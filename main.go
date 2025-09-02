@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,13 +19,21 @@ import (
 
 // Config 配置结构体
 type Config struct {
-	UpstreamUrl   string
-	DefaultKey    string
-	UpstreamToken string
-	Port          string
-	DebugMode     bool
-	ThinkTagsMode string
-	AnonTokenEnabled bool
+	UpstreamUrl           string
+	DefaultKey            string
+	UpstreamToken         string
+	Port                  string
+	DebugMode             bool
+	ThinkTagsMode         string
+	AnonTokenEnabled      bool
+	MaxConcurrentRequests int
+}
+
+// TokenCache Token缓存结构体
+type TokenCache struct {
+	token     string
+	expiresAt time.Time
+	mutex     sync.RWMutex
 }
 
 // getEnv 获取环境变量值，如果不存在则返回默认值
@@ -37,14 +46,22 @@ func getEnv(key, defaultValue string) string {
 
 // loadConfig 加载并验证配置
 func loadConfig() (*Config, error) {
+	maxConcurrent := 100 // 默认值
+	if envVal := getEnv("MAX_CONCURRENT_REQUESTS", "100"); envVal != "100" {
+		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 && parsed <= 1000 {
+			maxConcurrent = parsed
+		}
+	}
+
 	config := &Config{
-		UpstreamUrl:      getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions"),
-		DefaultKey:       getEnv("API_KEY", "sk-tbkFoKzk9a531YyUNNF5"),
-		UpstreamToken:    getEnv("UPSTREAM_TOKEN", ""),
-		Port:             getEnv("PORT", "8080"),
-		DebugMode:        getEnv("DEBUG_MODE", "true") == "true",
-		ThinkTagsMode:    getEnv("THINK_TAGS_MODE", "think"), // strip, think, raw
-		AnonTokenEnabled: getEnv("ANON_TOKEN_ENABLED", "true") == "true",
+		UpstreamUrl:           getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions"),
+		DefaultKey:            getEnv("API_KEY", "sk-tbkFoKzk9a531YyUNNF5"),
+		UpstreamToken:         getEnv("UPSTREAM_TOKEN", ""),
+		Port:                  getEnv("PORT", "8080"),
+		DebugMode:             getEnv("DEBUG_MODE", "true") == "true",
+		ThinkTagsMode:         getEnv("THINK_TAGS_MODE", "think"), // strip, think, raw
+		AnonTokenEnabled:      getEnv("ANON_TOKEN_ENABLED", "true") == "true",
+		MaxConcurrentRequests: maxConcurrent,
 	}
 
 	// 配置验证
@@ -88,11 +105,19 @@ func (c *Config) validate() error {
 		return fmt.Errorf("THINK_TAGS_MODE 必须是以下值之一: %v", validModes)
 	}
 
+	// 验证并发数限制
+	if c.MaxConcurrentRequests <= 0 || c.MaxConcurrentRequests > 1000 {
+		return fmt.Errorf("MAX_CONCURRENT_REQUESTS 必须在 1-1000 之间")
+	}
+
 	return nil
 }
 
-// 全局配置实例
-var appConfig *Config
+// 全局配置和缓存实例
+var (
+	appConfig  *Config
+	tokenCache *TokenCache
+)
 
 // 模型常量
 const (
@@ -118,15 +143,15 @@ var (
 	httpClient = &http.Client{
 		Timeout: 60 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:          200,  // 增加连接池大小
-			MaxIdleConnsPerHost:   50,   // 调整单主机连接数
-			MaxConnsPerHost:       100,  // 限制单主机最大连接
+			MaxIdleConns:          50, // 优化：减少全局空闲连接数
+			MaxIdleConnsPerHost:   10, // 优化：减少单主机空闲连接数（主要对接z.ai）
+			MaxConnsPerHost:       50, // 优化：减少单主机最大连接数
 			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,  // TLS握手超时
-			ExpectContinueTimeout: 1 * time.Second,   // Expect: 100-continue超时
-			ResponseHeaderTimeout: 10 * time.Second,  // 响应头超时
-			DisableKeepAlives:     false,             // 启用Keep-Alive
-			DisableCompression:    false,             // 启用压缩
+			TLSHandshakeTimeout:   10 * time.Second, // TLS握手超时
+			ExpectContinueTimeout: 1 * time.Second,  // Expect: 100-continue超时
+			ResponseHeaderTimeout: 10 * time.Second, // 响应头超时
+			DisableKeepAlives:     false,            // 启用Keep-Alive
+			DisableCompression:    false,            // 启用压缩
 		},
 	}
 
@@ -179,9 +204,17 @@ var (
 		},
 	}
 
+	// SSE缓冲区对象池，减少大缓冲区内存占用
+	sseBufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 8*1024) // 8KB初始缓冲区
+		},
+	}
+
 	// 并发控制：限制同时处理的请求数量
 	// 这可以防止在高并发时消耗过多资源
-	concurrencyLimiter = make(chan struct{}, 100) // 最多100个并发请求
+	// 注意：会在main函数中根据配置重新创建
+	concurrencyLimiter chan struct{}
 )
 
 // ToolFunction 工具函数结构
@@ -488,7 +521,7 @@ func logRequestStatsWithCode(model string, isStream bool, startTime time.Time, t
 	if isStream {
 		mode = "streaming"
 	}
-	
+
 	// 改进的usage信息格式化 - 借鉴Worker.js
 	usageStr := "no usage info"
 	if tokenUsage != nil {
@@ -504,13 +537,13 @@ func logRequestStatsWithCode(model string, isStream bool, startTime time.Time, t
 			usageStr = fmt.Sprintf("content_length: %v", length)
 		}
 	}
-	
+
 	// 增加状态码和错误信息
 	statusInfo := fmt.Sprintf("status:%d", statusCode)
 	if errorType != "" {
 		statusInfo += fmt.Sprintf(" error:%s", errorType)
 	}
-	
+
 	infoLog("请求完成 - 模型:%s 模式:%s 耗时:%v %s %s", model, mode, duration, statusInfo, usageStr)
 }
 
@@ -559,7 +592,7 @@ func handleAPIError(w http.ResponseWriter, statusCode int, errorType string, mes
 	if logMsg != "" {
 		debugLog(logMsg, args...)
 	}
-	
+
 	errorResponse := map[string]interface{}{
 		"error": map[string]interface{}{
 			"message": message,
@@ -567,19 +600,62 @@ func handleAPIError(w http.ResponseWriter, statusCode int, errorType string, mes
 			"code":    statusCode,
 		},
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(errorResponse)
 }
 
 // 获取匿名token（每次对话使用不同token，避免共享记忆）
+// GetToken 从缓存或新获取Token
+func (tc *TokenCache) GetToken() (string, error) {
+	// 先读锁检查缓存
+	tc.mutex.RLock()
+	if tc.token != "" && time.Now().Before(tc.expiresAt) {
+		token := tc.token
+		tc.mutex.RUnlock()
+		debugLog("使用缓存的匿名token")
+		return token, nil
+	}
+	tc.mutex.RUnlock()
+
+	// 需要获取新token，使用写锁
+	tc.mutex.Lock()
+	defer tc.mutex.Unlock()
+
+	// 双重检查，防止并发重复获取
+	if tc.token != "" && time.Now().Before(tc.expiresAt) {
+		debugLog("双重检查：使用缓存的匿名token")
+		return tc.token, nil
+	}
+
+	// 获取新token
+	newToken, err := getAnonymousTokenDirect()
+	if err == nil {
+		tc.token = newToken
+		tc.expiresAt = time.Now().Add(5 * time.Minute) // 5分钟缓存
+		debugLog("获取新的匿名token成功，缓存到30分钟")
+	} else {
+		debugLog("获取新的匿名token失败: %v", err)
+	}
+	return newToken, err
+}
+
+// getAnonymousToken 兼容性方法，使用缓存
 func getAnonymousToken() (string, error) {
+	if tokenCache == nil {
+		return "", fmt.Errorf("token cache not initialized")
+	}
+	return tokenCache.GetToken()
+}
+
+// getAnonymousTokenDirect 直接获取匿名token（原始方法，不使用缓存）
+func getAnonymousTokenDirect() (string, error) {
 	// 如果禁用匿名token，直接返回错误
 	if !appConfig.AnonTokenEnabled {
 		return "", fmt.Errorf("anonymous token disabled")
 	}
-	
+
 	req, err := http.NewRequest("GET", OriginBase+"/api/v1/auths/", nil)
 	if err != nil {
 		return "", err
@@ -623,6 +699,12 @@ func main() {
 		log.Fatalf("配置加载失败: %v", err)
 	}
 
+	// 初始化Token缓存
+	tokenCache = &TokenCache{}
+
+	// 初始化并发控制器
+	concurrencyLimiter = make(chan struct{}, appConfig.MaxConcurrentRequests)
+
 	http.HandleFunc("/v1/models", handleModels)
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	http.HandleFunc("/health", handleHealth) // 健康检查端点
@@ -634,15 +716,16 @@ func main() {
 	log.Printf("Debug模式: %v", appConfig.DebugMode)
 	log.Printf("匿名Token: %v", appConfig.AnonTokenEnabled)
 	log.Printf("思考标签模式: %s", appConfig.ThinkTagsMode)
+	log.Printf("并发限制: %d", appConfig.MaxConcurrentRequests)
 	log.Printf("健康检查端点: http://localhost%s/health", appConfig.Port)
 
 	server := &http.Server{
-		Addr:         appConfig.Port,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 90 * time.Second,  // 增加写超时，适应长流式响应
-		IdleTimeout:  120 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,  // 添加请求头读取超时
-		MaxHeaderBytes: 1 << 20,              // 1MB请求头限制
+		Addr:              appConfig.Port,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      90 * time.Second, // 增加写超时，适应长流式响应
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second, // 添加请求头读取超时
+		MaxHeaderBytes:    1 << 20,          // 1MB请求头限制
 	}
 
 	log.Fatal(server.ListenAndServe())
@@ -668,20 +751,21 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	// 检查上游服务可用性（简化版）
 	status := "healthy"
 	statusCode := http.StatusOK
-	
+
 	// 可以添加更多检查项，如数据库连接、上游API可用性等
-	
+
 	healthResponse := map[string]interface{}{
 		"status":    status,
 		"timestamp": time.Now().Unix(),
 		"version":   "1.0.0",
 		"config": map[string]interface{}{
-			"debug_mode":         appConfig.DebugMode,
-			"think_tags_mode":    appConfig.ThinkTagsMode,
-			"anon_token_enabled": appConfig.AnonTokenEnabled,
+			"debug_mode":              appConfig.DebugMode,
+			"think_tags_mode":         appConfig.ThinkTagsMode,
+			"anon_token_enabled":      appConfig.AnonTokenEnabled,
+			"max_concurrent_requests": appConfig.MaxConcurrentRequests,
 		},
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(healthResponse)
@@ -712,7 +796,7 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 func getModelsList() ModelsResponse {
 	// 首先尝试从上游获取模型列表（可选功能）
 	// 这里简化处理，直接返回默认列表
-	
+
 	return ModelsResponse{
 		Object: "list",
 		Data: []Model{
@@ -752,7 +836,7 @@ func getModelsList() ModelsResponse {
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now() // 记录请求开始时间
-	
+
 	// 并发控制：获取信号量
 	select {
 	case concurrencyLimiter <- struct{}{}:
@@ -761,7 +845,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		handleAPIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Server overloaded", "服务器过载，请求超时")
 		return
 	}
-	
+
 	setCORSHeaders(w)
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
@@ -794,9 +878,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
 
-	// 生成会话相关ID
-	chatID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), time.Now().Unix())
-	msgID := fmt.Sprintf("%d", time.Now().UnixNano())
+	// 生成会话相关ID - 优化时间戳获取
+	now := time.Now()
+	chatID := fmt.Sprintf("%d-%d", now.UnixNano(), now.Unix())
+	msgID := fmt.Sprintf("%d", now.UnixNano())
 
 	var (
 		modelID   string
@@ -1001,12 +1086,17 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 	writeSSEChunk(w, firstChunk)
 	flusher.Flush()
 
-	// 读取上游SSE流 - 使用增强的缓冲处理
+	// 读取上游SSE流 - 使用优化的缓冲处理
 	debugLog("开始读取上游SSE流")
 	scanner := bufio.NewScanner(resp.Body)
-	// 增加缓冲区大小以处理大数据块
-	buf := make([]byte, 0, 64*1024) // 64KB buffer
-	scanner.Buffer(buf, 1024*1024)  // 1MB max token size
+	// 使用对象池的缓冲区，减少内存分配
+	buf := sseBufferPool.Get().([]byte)
+	defer func() {
+		// 重置缓冲区并放回对象池
+		buf = buf[:0]
+		sseBufferPool.Put(buf)
+	}()
+	scanner.Buffer(buf, 512*1024) // 减少最大token大小到512KB
 	lineCount := 0
 
 	// 标记是否已发送最初的 answer 片段（来自 EditContent）
@@ -1034,9 +1124,9 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 		}
 
 		// 只记录重要的SSE事件，避免日志噪音
-	if lineCount%20 == 1 || strings.Contains(dataStr, "done") || strings.Contains(dataStr, "error") {
-		debugLog("处理SSE数据 (第%d行)", lineCount)
-	}
+		if lineCount%20 == 1 || strings.Contains(dataStr, "done") || strings.Contains(dataStr, "error") {
+			debugLog("处理SSE数据 (第%d行)", lineCount)
+		}
 
 		var upstreamData UpstreamData
 		if err := json.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
@@ -1076,7 +1166,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 				"completion_tokens": upstreamData.Data.Usage.CompletionTokens,
 				"total_tokens":      upstreamData.Data.Usage.TotalTokens,
 			}
-			debugLog("Token使用统计 - Prompt: %d, Completion: %d, Total: %d", 
+			debugLog("Token使用统计 - Prompt: %d, Completion: %d, Total: %d",
 				upstreamData.Data.Usage.PromptTokens,
 				upstreamData.Data.Usage.CompletionTokens,
 				upstreamData.Data.Usage.TotalTokens)
@@ -1288,7 +1378,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 	debugLog("非流式响应发送完成")
-	
+
 	// 记录请求统计信息
 	var usage map[string]interface{}
 	if fullContent.Len() > 0 {

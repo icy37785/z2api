@@ -19,7 +19,7 @@
 
 | 变量名 | 描述 | 默认值 | 必需 |
 |--------|------|--------|------|
-| `UPSTREAM_TOKEN` | Z.ai 访问令牌 | - | ✅ |
+| `UPSTREAM_TOKEN` | Z.ai 访问令牌 | - | ❌ |
 | `API_KEY` | 客户端 API 密钥 | `sk-tbkFoKzk9a531YyUNNF5` | ❌ |
 | `PORT` | 服务监听端口 | `8080` | ❌ |
 | `DEBUG_MODE` | 调试模式 | `true` | ❌ |
@@ -48,6 +48,10 @@ WORKDIR /root/
 COPY --from=builder /app/main .
 CMD ["./main"]
 ```
+
+### 使用打包好的 Docker 镜像部署
+
+`docker pull ghcr.io/icy37785/openai-compatible-api-proxy-for-z:main`
 
 ## 📖 支持的模型
 
