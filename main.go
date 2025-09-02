@@ -37,7 +37,6 @@ const (
 	ThinkingModelName = "glm-4.5-thinking"
 	SearchModelName   = "glm-4.5-search"
 	GLMAirModelName   = "glm-4.5-air"
-	GLMFlashModelName = "glm-4.5-flash"
 	GLMVision         = "glm-4.5v"
 )
 
@@ -314,12 +313,6 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 				OwnedBy: "z.ai",
 			},
 			{
-				ID:      GLMFlashModelName,
-				Object:  "model",
-				Created: time.Now().Unix(),
-				OwnedBy: "z.ai",
-			},
-			{
 				ID:      GLMVision,
 				Object:  "model",
 				Created: time.Now().Unix(),
@@ -370,6 +363,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	msgID := fmt.Sprintf("%d", time.Now().UnixNano())
 
 	var (
+		modelID   string
+		modelName string
 		isThing   bool
 		isSearch  bool
 		searchMcp string
@@ -377,19 +372,25 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Model {
 	case ThinkingModelName:
+		modelID = "0727-360B-API"
+		modelName = "GLM-4.5"
 		isThing = true
 	case SearchModelName:
+		modelID = "0727-360B-API"
+		modelName = "GLM-4.5"
 		isThing = true
 		isSearch = true
 		searchMcp = "deep-web-search"
 	case DefaultModelName:
 		// 默认模型不需要特殊处理
+		modelID = "0727-360B-API"
+		modelName = "GLM-4.5"
 	case GLMAirModelName:
-
-	case GLMFlashModelName:
-
+		modelID = "0727-106B-API"
+		modelName = "GLM-4.5-Air"
 	case GLMVision:
-
+		modelID = GLMVision
+		modelName = "GLM-4.5V"
 	default:
 		// 未知模型，使用默认处理
 		debugLog("未知模型: %s, 使用默认处理", req.Model)
@@ -400,7 +401,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Stream:   true, // 总是使用流式从上游获取
 		ChatID:   chatID,
 		ID:       msgID,
-		Model:    "0727-360B-API", // 上游实际模型ID
+		Model:    modelID, // 上游实际模型ID
 		Messages: req.Messages,
 		Params:   map[string]interface{}{},
 		Features: map[string]interface{}{
@@ -412,14 +413,17 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"title_generation": false,
 			"tags_generation":  false,
 		},
-		MCPServers: []string{
-			searchMcp,
-		},
+		MCPServers: func() []string {
+			if searchMcp != "" {
+				return []string{searchMcp}
+			}
+			return []string{}
+		}(),
 		ModelItem: struct {
 			ID      string `json:"id"`
 			Name    string `json:"name"`
 			OwnedBy string `json:"owned_by"`
-		}{ID: "0727-360B-API", Name: "GLM-4.5", OwnedBy: "openai"},
+		}{ID: modelID, Name: modelName, OwnedBy: "openai"},
 		ToolServers: []string{},
 		Variables: map[string]string{
 			"{{USER_NAME}}":        "User",
@@ -501,16 +505,15 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		debugLog("上游返回错误状态: %d", resp.StatusCode)
-		// 读取错误响应体
+		// 读取错误响应体用于调试
 		if DebugMode {
 			body, _ := io.ReadAll(resp.Body)
-			debugLog("上游错误响应: %s", string(body))
+			handleError(w, http.StatusBadGateway, "Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
+		} else {
+			handleError(w, http.StatusBadGateway, "Upstream error", "上游返回错误状态: %d", resp.StatusCode)
 		}
-		http.Error(w, "Upstream error", http.StatusBadGateway)
 		return
 	}
-
 
 	// 设置SSE头部
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -720,13 +723,13 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		debugLog("上游返回错误状态: %d", resp.StatusCode)
-		// 读取错误响应体
+		// 读取错误响应体用于调试
 		if DebugMode {
 			body, _ := io.ReadAll(resp.Body)
-			debugLog("上游错误响应: %s", string(body))
+			handleError(w, http.StatusBadGateway, "Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
+		} else {
+			handleError(w, http.StatusBadGateway, "Upstream error", "上游返回错误状态: %d", resp.StatusCode)
 		}
-		http.Error(w, "Upstream error", http.StatusBadGateway)
 		return
 	}
 
