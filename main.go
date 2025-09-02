@@ -318,9 +318,19 @@ func normalizeMessage(msg Message) UpstreamMessage {
 	}
 
 	return UpstreamMessage{
-		Role:             msg.Role,
+		Role:             normalizeRole(msg.Role), // 规范化角色名称
 		Content:          textContent,
 		ReasoningContent: msg.ReasoningContent,
+	}
+}
+
+// normalizeRole 规范化角色名称，处理OpenAI和Z.ai之间的差异
+func normalizeRole(role string) string {
+	switch role {
+	case "developer":
+		return "system" // developer角色映射为system
+	default:
+		return role
 	}
 }
 
@@ -410,10 +420,19 @@ func logRequestStats(model string, isStream bool, startTime time.Time, tokenUsag
 		mode = "streaming"
 	}
 	
+	// 改进的usage信息格式化 - 借鉴Worker.js
 	usageStr := "no usage info"
 	if tokenUsage != nil {
-		if total, ok := tokenUsage["total_tokens"]; ok {
+		if prompt, hasPrompt := tokenUsage["prompt_tokens"]; hasPrompt {
+			if completion, hasCompletion := tokenUsage["completion_tokens"]; hasCompletion {
+				if total, hasTotal := tokenUsage["total_tokens"]; hasTotal {
+					usageStr = fmt.Sprintf("tokens(p:%v/c:%v/t:%v)", prompt, completion, total)
+				}
+			}
+		} else if total, ok := tokenUsage["total_tokens"]; ok {
 			usageStr = fmt.Sprintf("tokens: %v", total)
+		} else if length, ok := tokenUsage["content_length"]; ok {
+			usageStr = fmt.Sprintf("content_length: %v", length)
 		}
 	}
 	
@@ -458,6 +477,25 @@ func handleError(w http.ResponseWriter, statusCode int, message string, logMsg s
 		debugLog(logMsg, args...)
 	}
 	http.Error(w, message, statusCode)
+}
+
+// handleAPIError 处理API格式的错误响应，借鉴Worker.js的错误格式
+func handleAPIError(w http.ResponseWriter, statusCode int, errorType string, message string, logMsg string, args ...interface{}) {
+	if logMsg != "" {
+		debugLog(logMsg, args...)
+	}
+	
+	errorResponse := map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": message,
+			"type":    errorType,
+			"code":    statusCode,
+		},
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(errorResponse)
 }
 
 // 获取匿名token（每次对话使用不同token，避免共享记忆）
@@ -891,13 +929,17 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 			break
 		}
 
-		// 记录usage信息
+		// 记录usage信息 - 借鉴Worker.js的详细处理
 		if upstreamData.Data.Usage.TotalTokens > 0 {
 			lastUsage = map[string]interface{}{
 				"prompt_tokens":     upstreamData.Data.Usage.PromptTokens,
 				"completion_tokens": upstreamData.Data.Usage.CompletionTokens,
 				"total_tokens":      upstreamData.Data.Usage.TotalTokens,
 			}
+			debugLog("Token使用统计 - Prompt: %d, Completion: %d, Total: %d", 
+				upstreamData.Data.Usage.PromptTokens,
+				upstreamData.Data.Usage.CompletionTokens,
+				upstreamData.Data.Usage.TotalTokens)
 		}
 
 		// 只记录重要阶段变化，减少噪音
