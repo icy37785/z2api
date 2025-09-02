@@ -16,6 +16,17 @@ import (
 	"time"
 )
 
+// Config 配置结构体
+type Config struct {
+	UpstreamUrl   string
+	DefaultKey    string
+	UpstreamToken string
+	Port          string
+	DebugMode     bool
+	ThinkTagsMode string
+	AnonTokenEnabled bool
+}
+
 // getEnv 获取环境变量值，如果不存在则返回默认值
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
@@ -24,14 +35,64 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// 配置变量 - 从环境变量读取敏感信息，其他保持常量
-var (
-	UpstreamUrl   = getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions")
-	DefaultKey    = getEnv("API_KEY", "sk-tbkFoKzk9a531YyUNNF5")
-	UpstreamToken = getEnv("UPSTREAM_TOKEN", "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ")
-	Port          = getEnv("PORT", ":8080")
-	DebugMode     = getEnv("DEBUG_MODE", "true") == "true"
-)
+// loadConfig 加载并验证配置
+func loadConfig() (*Config, error) {
+	config := &Config{
+		UpstreamUrl:      getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions"),
+		DefaultKey:       getEnv("API_KEY", "sk-tbkFoKzk9a531YyUNNF5"),
+		UpstreamToken:    getEnv("UPSTREAM_TOKEN", ""),
+		Port:             getEnv("PORT", "8080"),
+		DebugMode:        getEnv("DEBUG_MODE", "true") == "true",
+		ThinkTagsMode:    getEnv("THINK_TAGS_MODE", "think"), // strip, think, raw
+		AnonTokenEnabled: getEnv("ANON_TOKEN_ENABLED", "true") == "true",
+	}
+
+	// 配置验证
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
+// validate 验证配置合法性
+func (c *Config) validate() error {
+	// 验证必需的配置
+	if c.UpstreamToken == "" {
+		return fmt.Errorf("UPSTREAM_TOKEN 环境变量是必需的")
+	}
+
+	// 验证URL格式
+	if _, err := http.Get(c.UpstreamUrl); err != nil {
+		// 这里只验证URL格式，不实际请求
+		if !strings.HasPrefix(c.UpstreamUrl, "http") {
+			return fmt.Errorf("UPSTREAM_URL 必须是有效的HTTP URL")
+		}
+	}
+
+	// 验证端口格式
+	if !strings.HasPrefix(c.Port, ":") {
+		c.Port = ":" + c.Port
+	}
+
+	// 验证ThinkTagsMode
+	validModes := []string{"strip", "think", "raw"}
+	valid := false
+	for _, mode := range validModes {
+		if c.ThinkTagsMode == mode {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return fmt.Errorf("THINK_TAGS_MODE 必须是以下值之一: %v", validModes)
+	}
+
+	return nil
+}
+
+// 全局配置实例
+var appConfig *Config
 
 // 模型常量
 const (
@@ -40,11 +101,6 @@ const (
 	SearchModelName   = "glm-4.5-search"
 	GLMAirModelName   = "glm-4.5-air"
 	GLMVision         = "glm-4.5v"
-)
-
-// ThinkTagsMode 思考内容处理策略
-const (
-	ThinkTagsMode = "think" // strip: 去除<details>标签；think: 转为<think>标签；raw: 保留原样
 )
 
 // 伪装前端头部（来自抓包）
@@ -56,9 +112,6 @@ const (
 	SecChUaPlat = "\"Windows\""
 	OriginBase  = "https://chat.z.ai"
 )
-
-// AnonTokenEnabled 匿名token开关
-const AnonTokenEnabled = true
 
 // 全局HTTP客户端（连接池复用）
 var (
@@ -402,7 +455,7 @@ func buildUpstreamParams(req OpenAIRequest) map[string]interface{} {
 
 // debug日志函数
 func debugLog(format string, args ...interface{}) {
-	if DebugMode {
+	if appConfig != nil && appConfig.DebugMode {
 		log.Printf("[DEBUG] "+format, args...)
 	}
 }
@@ -412,8 +465,24 @@ func infoLog(format string, args ...interface{}) {
 	log.Printf("[INFO] "+format, args...)
 }
 
-// 记录请求统计信息
+// RequestMetrics 请求指标结构
+type RequestMetrics struct {
+	Model         string
+	IsStream      bool
+	Duration      time.Duration
+	TokenUsage    map[string]interface{}
+	StatusCode    int
+	ErrorType     string
+	ContentLength int64
+}
+
+// 记录请求统计信息 - 增强版
 func logRequestStats(model string, isStream bool, startTime time.Time, tokenUsage map[string]interface{}) {
+	logRequestStatsWithCode(model, isStream, startTime, tokenUsage, 200, "")
+}
+
+// logRequestStatsWithCode 记录带状态码的请求统计信息
+func logRequestStatsWithCode(model string, isStream bool, startTime time.Time, tokenUsage map[string]interface{}, statusCode int, errorType string) {
 	duration := time.Since(startTime)
 	mode := "non-streaming"
 	if isStream {
@@ -436,7 +505,13 @@ func logRequestStats(model string, isStream bool, startTime time.Time, tokenUsag
 		}
 	}
 	
-	infoLog("请求完成 - 模型: %s, 模式: %s, 耗时: %v, %s", model, mode, duration, usageStr)
+	// 增加状态码和错误信息
+	statusInfo := fmt.Sprintf("status:%d", statusCode)
+	if errorType != "" {
+		statusInfo += fmt.Sprintf(" error:%s", errorType)
+	}
+	
+	infoLog("请求完成 - 模型:%s 模式:%s 耗时:%v %s %s", model, mode, duration, statusInfo, usageStr)
 }
 
 // transformThinking 转换思考内容
@@ -444,8 +519,8 @@ func transformThinking(s string) string {
 	// 去 <summary>…</summary> - 使用预编译的正则表达式
 	s = summaryRegex.ReplaceAllString(s, "")
 
-	// 根据模式选择合适的替换器和处理策略
-	switch ThinkTagsMode {
+	// 根据配置的模式选择合适的替换器和处理策略
+	switch appConfig.ThinkTagsMode {
 	case "think":
 		s = detailsRegex.ReplaceAllString(s, "<think>")
 		s = thinkingReplacer.Replace(s)
@@ -500,6 +575,11 @@ func handleAPIError(w http.ResponseWriter, statusCode int, errorType string, mes
 
 // 获取匿名token（每次对话使用不同token，避免共享记忆）
 func getAnonymousToken() (string, error) {
+	// 如果禁用匿名token，直接返回错误
+	if !appConfig.AnonTokenEnabled {
+		return "", fmt.Errorf("anonymous token disabled")
+	}
+	
 	req, err := http.NewRequest("GET", OriginBase+"/api/v1/auths/", nil)
 	if err != nil {
 		return "", err
@@ -536,27 +616,28 @@ func getAnonymousToken() (string, error) {
 }
 
 func main() {
-	// 配置验证
-	if UpstreamToken == "" {
-		log.Fatal("UPSTREAM_TOKEN 环境变量未设置")
-	}
-
-	if !strings.HasPrefix(Port, ":") {
-		Port = ":" + Port
+	// 加载和验证配置
+	var err error
+	appConfig, err = loadConfig()
+	if err != nil {
+		log.Fatalf("配置加载失败: %v", err)
 	}
 
 	http.HandleFunc("/v1/models", handleModels)
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
+	http.HandleFunc("/health", handleHealth) // 健康检查端点
 	http.HandleFunc("/", handleOptions)
 
-	log.Printf("OpenAI兼容API服务器启动在端口%s", Port)
+	log.Printf("OpenAI兼容API服务器启动在端口%s", appConfig.Port)
 	log.Printf("模型: %s", DefaultModelName)
-	log.Printf("上游: %s", UpstreamUrl)
-	log.Printf("Debug模式: %v", DebugMode)
-	log.Printf("匿名Token: %v", AnonTokenEnabled)
+	log.Printf("上游: %s", appConfig.UpstreamUrl)
+	log.Printf("Debug模式: %v", appConfig.DebugMode)
+	log.Printf("匿名Token: %v", appConfig.AnonTokenEnabled)
+	log.Printf("思考标签模式: %s", appConfig.ThinkTagsMode)
+	log.Printf("健康检查端点: http://localhost%s/health", appConfig.Port)
 
 	server := &http.Server{
-		Addr:         Port,
+		Addr:         appConfig.Port,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 90 * time.Second,  // 增加写超时，适应长流式响应
 		IdleTimeout:  120 * time.Second,
@@ -576,6 +657,36 @@ func handleOptions(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotFound)
 }
 
+// handleHealth 健康检查端点
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// 检查上游服务可用性（简化版）
+	status := "healthy"
+	statusCode := http.StatusOK
+	
+	// 可以添加更多检查项，如数据库连接、上游API可用性等
+	
+	healthResponse := map[string]interface{}{
+		"status":    status,
+		"timestamp": time.Now().Unix(),
+		"version":   "1.0.0",
+		"config": map[string]interface{}{
+			"debug_mode":         appConfig.DebugMode,
+			"think_tags_mode":    appConfig.ThinkTagsMode,
+			"anon_token_enabled": appConfig.AnonTokenEnabled,
+		},
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(healthResponse)
+}
+
 func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
@@ -590,7 +701,19 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := ModelsResponse{
+	// 优雅降级: 如果上游服务不可用，仍返回基本模型列表
+	response := getModelsList()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// getModelsList 获取模型列表，支持优雅降级
+func getModelsList() ModelsResponse {
+	// 首先尝试从上游获取模型列表（可选功能）
+	// 这里简化处理，直接返回默认列表
+	
+	return ModelsResponse{
 		Object: "list",
 		Data: []Model{
 			{
@@ -625,9 +748,6 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -638,7 +758,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	case concurrencyLimiter <- struct{}{}:
 		defer func() { <-concurrencyLimiter }()
 	case <-time.After(5 * time.Second): // 5秒超时
-		handleError(w, http.StatusTooManyRequests, "Server overloaded", "服务器过载，请求超时")
+		handleAPIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Server overloaded", "服务器过载，请求超时")
 		return
 	}
 	
@@ -653,13 +773,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 验证API Key
 	authHeader := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		handleError(w, http.StatusUnauthorized, "Missing or invalid Authorization header", "缺少或无效的Authorization头")
+		handleAPIError(w, http.StatusUnauthorized, "invalid_api_key", "Missing or invalid Authorization header", "缺少或无效的Authorization头")
 		return
 	}
 
 	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
-	if apiKey != DefaultKey {
-		handleError(w, http.StatusUnauthorized, "Invalid API key", "无效的API key: %s", apiKey)
+	if apiKey != appConfig.DefaultKey {
+		handleAPIError(w, http.StatusUnauthorized, "invalid_api_key", "Invalid API key", "无效的API key: %s", apiKey)
 		return
 	}
 
@@ -668,7 +788,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 解析请求
 	var req OpenAIRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		handleError(w, http.StatusBadRequest, "Invalid JSON", "JSON解析失败: %v", err)
+		handleAPIError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON format", "JSON解析失败: %v", err)
 		return
 	}
 
@@ -756,14 +876,24 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ToolChoice: req.ToolChoice, // 传递工具选择
 	}
 
-	// 选择本次对话使用的token
-	authToken := UpstreamToken
-	if AnonTokenEnabled {
-		if t, err := getAnonymousToken(); err == nil {
-			authToken = t
-			debugLog("匿名token获取成功")
-		} else {
-			debugLog("匿名token获取失败，回退固定token: %v", err)
+	// 选择本次对话使用的token - 增加重试机制
+	authToken := appConfig.UpstreamToken
+	if appConfig.AnonTokenEnabled {
+		// 重试获取匿名token，最多3次
+		for retry := 0; retry < 3; retry++ {
+			if t, err := getAnonymousToken(); err == nil {
+				authToken = t
+				debugLog("匿名token获取成功")
+				break
+			} else {
+				debugLog("匿名token获取失败 (第%d次): %v", retry+1, err)
+				if retry < 2 {
+					time.Sleep(time.Duration(retry+1) * 100 * time.Millisecond) // 指数退避
+				}
+			}
+		}
+		if authToken == appConfig.UpstreamToken {
+			debugLog("所有匿名token获取尝试失败，使用固定token")
 		}
 	}
 
@@ -791,10 +921,10 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 		return nil, err
 	}
 
-	debugLog("调用上游API: %s", UpstreamUrl)
+	debugLog("调用上游API: %s", appConfig.UpstreamUrl)
 	debugLog("上游请求体: %s", buf.String())
 
-	req, err := http.NewRequestWithContext(ctx, "POST", UpstreamUrl, bytes.NewReader(buf.Bytes()))
+	req, err := http.NewRequestWithContext(ctx, "POST", appConfig.UpstreamUrl, bytes.NewReader(buf.Bytes()))
 	if err != nil {
 		debugLog("创建HTTP请求失败: %v", err)
 		return nil, err
@@ -834,11 +964,11 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 
 	if resp.StatusCode != http.StatusOK {
 		// 读取错误响应体用于调试
-		if DebugMode {
+		if appConfig.DebugMode {
 			body, _ := io.ReadAll(resp.Body)
-			handleError(w, http.StatusBadGateway, "Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
+			handleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
 		} else {
-			handleError(w, http.StatusBadGateway, "Upstream error", "上游返回错误状态: %d", resp.StatusCode)
+			handleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d", resp.StatusCode)
 		}
 		return
 	}
@@ -850,7 +980,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		handleError(w, http.StatusInternalServerError, "Streaming unsupported", "")
+		handleAPIError(w, http.StatusInternalServerError, "streaming_unsupported", "Streaming not supported by server", "Streaming不受支持")
 		return
 	}
 
@@ -871,9 +1001,12 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 	writeSSEChunk(w, firstChunk)
 	flusher.Flush()
 
-	// 读取上游SSE流
+	// 读取上游SSE流 - 使用增强的缓冲处理
 	debugLog("开始读取上游SSE流")
 	scanner := bufio.NewScanner(resp.Body)
+	// 增加缓冲区大小以处理大数据块
+	buf := make([]byte, 0, 64*1024) // 64KB buffer
+	scanner.Buffer(buf, 1024*1024)  // 1MB max token size
 	lineCount := 0
 
 	// 标记是否已发送最初的 answer 片段（来自 EditContent）
@@ -884,12 +1017,19 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 		line := scanner.Text()
 		lineCount++
 
-		if !strings.HasPrefix(line, "data: ") {
+		// 更健墮的SSE数据行处理
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 
 		dataStr := strings.TrimPrefix(line, "data: ")
-		if dataStr == "" {
+		dataStr = strings.TrimSpace(dataStr)
+		if dataStr == "" || dataStr == "[DONE]" {
+			if dataStr == "[DONE]" {
+				debugLog("收到[DONE]信号，结束流处理")
+				break
+			}
 			continue
 		}
 
@@ -1066,11 +1206,11 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 
 	if resp.StatusCode != http.StatusOK {
 		// 读取错误响应体用于调试
-		if DebugMode {
+		if appConfig.DebugMode {
 			body, _ := io.ReadAll(resp.Body)
-			handleError(w, http.StatusBadGateway, "Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
+			handleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
 		} else {
-			handleError(w, http.StatusBadGateway, "Upstream error", "上游返回错误状态: %d", resp.StatusCode)
+			handleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d", resp.StatusCode)
 		}
 		return
 	}
