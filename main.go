@@ -70,13 +70,43 @@ var (
 	}
 )
 
+// ToolFunction 工具函数结构
+type ToolFunction struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Parameters  interface{} `json:"parameters"`
+}
+
+// Tool 工具结构
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
 // OpenAIRequest OpenAI 请求结构
 type OpenAIRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Stream      bool      `json:"stream,omitempty"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Model             string                 `json:"model"`
+	Messages          []Message              `json:"messages"`
+	Stream            bool                   `json:"stream,omitempty"`
+	Temperature       *float64               `json:"temperature,omitempty"`       // 使用指针表示可选
+	MaxTokens         *int                   `json:"max_tokens,omitempty"`        // 使用指针表示可选
+	TopP              *float64               `json:"top_p,omitempty"`             // 使用指针表示可选
+	N                 *int                   `json:"n,omitempty"`                 // 使用指针表示可选
+	Stop              interface{}            `json:"stop,omitempty"`              // string or []string
+	PresencePenalty   *float64               `json:"presence_penalty,omitempty"`  // 使用指针表示可选
+	FrequencyPenalty  *float64               `json:"frequency_penalty,omitempty"` // 使用指针表示可选
+	LogitBias         map[string]float64     `json:"logit_bias,omitempty"`        // 修正为float64
+	User              string                 `json:"user,omitempty"`
+	Tools             []Tool                 `json:"tools,omitempty"`
+	ToolChoice        interface{}            `json:"tool_choice,omitempty"`
+	ResponseFormat    interface{}            `json:"response_format,omitempty"`
+	Seed              *int                   `json:"seed,omitempty"`              // 使用指针表示可选
+	LogProbs          bool                   `json:"logprobs,omitempty"`
+	TopLogProbs       *int                   `json:"top_logprobs,omitempty"`      // 使用指针，需要0-5验证
+	ParallelToolCalls *bool                  `json:"parallel_tool_calls,omitempty"` // 使用指针表示可选
+	ServiceTier       string                 `json:"service_tier,omitempty"`      // 新增：服务层级
+	Store             *bool                  `json:"store,omitempty"`             // 新增：是否存储
+	Metadata          map[string]interface{} `json:"metadata,omitempty"`          // 新增：元数据
 }
 
 // ContentPart 内容部分结构（用于多模态消息）
@@ -120,6 +150,8 @@ type UpstreamRequest struct {
 	} `json:"model_item,omitempty"`
 	ToolServers []string          `json:"tool_servers,omitempty"`
 	Variables   map[string]string `json:"variables,omitempty"`
+	Tools       []Tool            `json:"tools,omitempty"`
+	ToolChoice  interface{}       `json:"tool_choice,omitempty"`
 }
 
 // OpenAIResponse OpenAI 响应结构
@@ -229,6 +261,72 @@ func normalizeMessage(msg Message) UpstreamMessage {
 		Content:          textContent,
 		ReasoningContent: msg.ReasoningContent,
 	}
+}
+
+// buildUpstreamParams 构建上游请求参数
+func buildUpstreamParams(req OpenAIRequest) map[string]interface{} {
+	params := make(map[string]interface{})
+	
+	// 传递标准OpenAI参数（使用指针类型安全检查）
+	if req.Temperature != nil {
+		params["temperature"] = *req.Temperature
+	}
+	if req.MaxTokens != nil {
+		params["max_tokens"] = *req.MaxTokens
+	}
+	if req.TopP != nil {
+		params["top_p"] = *req.TopP
+	}
+	if req.N != nil {
+		params["n"] = *req.N
+	}
+	if req.Stop != nil {
+		params["stop"] = req.Stop
+	}
+	if req.PresencePenalty != nil {
+		params["presence_penalty"] = *req.PresencePenalty
+	}
+	if req.FrequencyPenalty != nil {
+		params["frequency_penalty"] = *req.FrequencyPenalty
+	}
+	if req.LogitBias != nil && len(req.LogitBias) > 0 {
+		params["logit_bias"] = req.LogitBias
+	}
+	if req.User != "" {
+		params["user"] = req.User
+	}
+	if req.ResponseFormat != nil {
+		params["response_format"] = req.ResponseFormat
+	}
+	if req.Seed != nil {
+		params["seed"] = *req.Seed
+	}
+	if req.LogProbs {
+		params["logprobs"] = req.LogProbs
+	}
+	if req.TopLogProbs != nil {
+		// 验证 top_logprobs 必须在 0-5 范围内
+		topLogProbs := *req.TopLogProbs
+		if topLogProbs >= 0 && topLogProbs <= 5 {
+			params["top_logprobs"] = topLogProbs
+		} else {
+			debugLog("top_logprobs 必须在0-5范围内，收到值: %d", topLogProbs)
+		}
+	}
+	if req.ParallelToolCalls != nil {
+		params["parallel_tool_calls"] = *req.ParallelToolCalls
+	}
+	if req.ServiceTier != "" {
+		params["service_tier"] = req.ServiceTier
+	}
+	if req.Store != nil {
+		params["store"] = *req.Store
+	}
+	if req.Metadata != nil && len(req.Metadata) > 0 {
+		params["metadata"] = req.Metadata
+	}
+	
+	return params
 }
 
 // debug日志函数
@@ -465,7 +563,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ID:       msgID,
 		Model:    modelID, // 上游实际模型ID
 		Messages: normalizedMessages,
-		Params:   map[string]interface{}{},
+		Params: buildUpstreamParams(req),
 		Features: map[string]interface{}{
 			"enable_thinking": isThing,
 			"web_search":      isSearch,
@@ -492,6 +590,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"{{USER_LOCATION}}":    "Unknown",
 			"{{CURRENT_DATETIME}}": time.Now().Format("2006-01-02 15:04:05"),
 		},
+		Tools:      req.Tools,      // 传递工具定义
+		ToolChoice: req.ToolChoice, // 传递工具选择
 	}
 
 	// 选择本次对话使用的token
