@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -63,11 +65,70 @@ var (
 	httpClient = &http.Client{
 		Timeout: 60 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:          200,  // 增加连接池大小
+			MaxIdleConnsPerHost:   50,   // 调整单主机连接数
+			MaxConnsPerHost:       100,  // 限制单主机最大连接
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,  // TLS握手超时
+			ExpectContinueTimeout: 1 * time.Second,   // Expect: 100-continue超时
+			ResponseHeaderTimeout: 10 * time.Second,  // 响应头超时
+			DisableKeepAlives:     false,             // 启用Keep-Alive
+			DisableCompression:    false,             // 启用压缩
 		},
 	}
+
+	// 预编译的正则表达式模式
+	summaryRegex      = regexp.MustCompile(`(?s)<summary>.*?</summary>`)
+	detailsRegex      = regexp.MustCompile(`<details[^>]*>`)
+	detailsSplitRegex = regexp.MustCompile(`\</details\>`)
+
+	// 字符串替换器
+	thinkingReplacer = strings.NewReplacer(
+		"</thinking>", "",
+		"<Full>", "",
+		"</Full>", "",
+		"\n> ", "\n",
+		"</details>", "</think>", // 为think模式预设
+	)
+
+	// strip模式的替换器
+	thinkingStripReplacer = strings.NewReplacer(
+		"</thinking>", "",
+		"<Full>", "",
+		"</Full>", "",
+		"\n> ", "\n",
+		"</details>", "", // 为strip模式预设
+	)
+
+	// 对象池优化内存分配
+	stringBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return &strings.Builder{}
+		},
+	}
+
+	openAIResponsePool = sync.Pool{
+		New: func() interface{} {
+			return &OpenAIResponse{}
+		},
+	}
+
+	// 添加更多对象池优化内存分配
+	bytesBufferPool = sync.Pool{
+		New: func() interface{} {
+			return bytes.NewBuffer(make([]byte, 0, 1024)) // 预分配1KB
+		},
+	}
+
+	upstreamRequestPool = sync.Pool{
+		New: func() interface{} {
+			return &UpstreamRequest{}
+		},
+	}
+
+	// 并发控制：限制同时处理的请求数量
+	// 这可以防止在高并发时消耗过多资源
+	concurrencyLimiter = make(chan struct{}, 100) // 最多100个并发请求
 )
 
 // ToolFunction 工具函数结构
@@ -100,13 +161,13 @@ type OpenAIRequest struct {
 	Tools             []Tool                 `json:"tools,omitempty"`
 	ToolChoice        interface{}            `json:"tool_choice,omitempty"`
 	ResponseFormat    interface{}            `json:"response_format,omitempty"`
-	Seed              *int                   `json:"seed,omitempty"`              // 使用指针表示可选
+	Seed              *int                   `json:"seed,omitempty"` // 使用指针表示可选
 	LogProbs          bool                   `json:"logprobs,omitempty"`
-	TopLogProbs       *int                   `json:"top_logprobs,omitempty"`      // 使用指针，需要0-5验证
+	TopLogProbs       *int                   `json:"top_logprobs,omitempty"`        // 使用指针，需要0-5验证
 	ParallelToolCalls *bool                  `json:"parallel_tool_calls,omitempty"` // 使用指针表示可选
-	ServiceTier       string                 `json:"service_tier,omitempty"`      // 新增：服务层级
-	Store             *bool                  `json:"store,omitempty"`             // 新增：是否存储
-	Metadata          map[string]interface{} `json:"metadata,omitempty"`          // 新增：元数据
+	ServiceTier       string                 `json:"service_tier,omitempty"`        // 新增：服务层级
+	Store             *bool                  `json:"store,omitempty"`               // 新增：是否存储
+	Metadata          map[string]interface{} `json:"metadata,omitempty"`            // 新增：元数据
 }
 
 // ContentPart 内容部分结构（用于多模态消息）
@@ -255,7 +316,7 @@ func normalizeMessage(msg Message) UpstreamMessage {
 	if msg.Content != nil {
 		textContent = extractTextContent(msg.Content)
 	}
-	
+
 	return UpstreamMessage{
 		Role:             msg.Role,
 		Content:          textContent,
@@ -266,7 +327,7 @@ func normalizeMessage(msg Message) UpstreamMessage {
 // buildUpstreamParams 构建上游请求参数
 func buildUpstreamParams(req OpenAIRequest) map[string]interface{} {
 	params := make(map[string]interface{})
-	
+
 	// 传递标准OpenAI参数（使用指针类型安全检查）
 	if req.Temperature != nil {
 		params["temperature"] = *req.Temperature
@@ -289,7 +350,7 @@ func buildUpstreamParams(req OpenAIRequest) map[string]interface{} {
 	if req.FrequencyPenalty != nil {
 		params["frequency_penalty"] = *req.FrequencyPenalty
 	}
-	if req.LogitBias != nil && len(req.LogitBias) > 0 {
+	if len(req.LogitBias) > 0 {
 		params["logit_bias"] = req.LogitBias
 	}
 	if req.User != "" {
@@ -322,10 +383,10 @@ func buildUpstreamParams(req OpenAIRequest) map[string]interface{} {
 	if req.Store != nil {
 		params["store"] = *req.Store
 	}
-	if req.Metadata != nil && len(req.Metadata) > 0 {
+	if len(req.Metadata) > 0 {
 		params["metadata"] = req.Metadata
 	}
-	
+
 	return params
 }
 
@@ -336,26 +397,58 @@ func debugLog(format string, args ...interface{}) {
 	}
 }
 
+// infoLog 记录重要信息（不受DEBUG模式限制）
+func infoLog(format string, args ...interface{}) {
+	log.Printf("[INFO] "+format, args...)
+}
+
+// 记录请求统计信息
+func logRequestStats(model string, isStream bool, startTime time.Time, tokenUsage map[string]interface{}) {
+	duration := time.Since(startTime)
+	mode := "non-streaming"
+	if isStream {
+		mode = "streaming"
+	}
+	
+	usageStr := "no usage info"
+	if tokenUsage != nil {
+		if total, ok := tokenUsage["total_tokens"]; ok {
+			usageStr = fmt.Sprintf("tokens: %v", total)
+		}
+	}
+	
+	infoLog("请求完成 - 模型: %s, 模式: %s, 耗时: %v, %s", model, mode, duration, usageStr)
+}
+
 // transformThinking 转换思考内容
 func transformThinking(s string) string {
-	// 去 <summary>…</summary>
-	s = regexp.MustCompile(`(?s)<summary>.*?</summary>`).ReplaceAllString(s, "")
-	// 清理残留自定义标签，如 </thinking>、<Full> 等
-	s = strings.ReplaceAll(s, "</thinking>", "")
-	s = strings.ReplaceAll(s, "<Full>", "")
-	s = strings.ReplaceAll(s, "</Full>", "")
-	s = strings.TrimSpace(s)
+	// 去 <summary>…</summary> - 使用预编译的正则表达式
+	s = summaryRegex.ReplaceAllString(s, "")
+
+	// 根据模式选择合适的替换器和处理策略
 	switch ThinkTagsMode {
 	case "think":
-		s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "<think>")
-		s = strings.ReplaceAll(s, "</details>", "</think>")
+		s = detailsRegex.ReplaceAllString(s, "<think>")
+		s = thinkingReplacer.Replace(s)
 	case "strip":
-		s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "")
-		s = strings.ReplaceAll(s, "</details>", "")
+		s = detailsRegex.ReplaceAllString(s, "")
+		s = thinkingStripReplacer.Replace(s)
+	case "raw":
+		// 只做基本清理，保留原始标签
+		s = strings.NewReplacer(
+			"</thinking>", "",
+			"<Full>", "",
+			"</Full>", "",
+			"\n> ", "\n",
+		).Replace(s)
+	default:
+		// 默认使用think模式
+		s = detailsRegex.ReplaceAllString(s, "<think>")
+		s = thinkingReplacer.Replace(s)
 	}
-	// 处理每行前缀 "> "（包括起始位置）
+
+	// 处理起始位置的前缀
 	s = strings.TrimPrefix(s, "> ")
-	s = strings.ReplaceAll(s, "\n> ", "\n")
 	return strings.TrimSpace(s)
 }
 
@@ -405,6 +498,15 @@ func getAnonymousToken() (string, error) {
 }
 
 func main() {
+	// 配置验证
+	if UpstreamToken == "" {
+		log.Fatal("UPSTREAM_TOKEN 环境变量未设置")
+	}
+
+	if !strings.HasPrefix(Port, ":") {
+		Port = ":" + Port
+	}
+
 	http.HandleFunc("/v1/models", handleModels)
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	http.HandleFunc("/", handleOptions)
@@ -413,7 +515,18 @@ func main() {
 	log.Printf("模型: %s", DefaultModelName)
 	log.Printf("上游: %s", UpstreamUrl)
 	log.Printf("Debug模式: %v", DebugMode)
-	log.Fatal(http.ListenAndServe(Port, nil))
+	log.Printf("匿名Token: %v", AnonTokenEnabled)
+
+	server := &http.Server{
+		Addr:         Port,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 90 * time.Second,  // 增加写超时，适应长流式响应
+		IdleTimeout:  120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,  // 添加请求头读取超时
+		MaxHeaderBytes: 1 << 20,              // 1MB请求头限制
+	}
+
+	log.Fatal(server.ListenAndServe())
 }
 
 func handleOptions(w http.ResponseWriter, r *http.Request) {
@@ -480,6 +593,17 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now() // 记录请求开始时间
+	
+	// 并发控制：获取信号量
+	select {
+	case concurrencyLimiter <- struct{}{}:
+		defer func() { <-concurrencyLimiter }()
+	case <-time.After(5 * time.Second): // 5秒超时
+		handleError(w, http.StatusTooManyRequests, "Server overloaded", "服务器过载，请求超时")
+		return
+	}
+	
 	setCORSHeaders(w)
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
@@ -563,7 +687,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ID:       msgID,
 		Model:    modelID, // 上游实际模型ID
 		Messages: normalizedMessages,
-		Params: buildUpstreamParams(req),
+		Params:   buildUpstreamParams(req),
 		Features: map[string]interface{}{
 			"enable_thinking": isThing,
 			"web_search":      isSearch,
@@ -599,12 +723,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if AnonTokenEnabled {
 		if t, err := getAnonymousToken(); err == nil {
 			authToken = t
-			debugLog("匿名token获取成功: %s...", func() string {
-				if len(t) > 10 {
-					return t[:10]
-				}
-				return t
-			}())
+			debugLog("匿名token获取成功")
 		} else {
 			debugLog("匿名token获取失败，回退固定token: %v", err)
 		}
@@ -612,23 +731,32 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 调用上游API
 	if req.Stream {
-		handleStreamResponseWithIDs(w, upstreamReq, chatID, authToken)
+		handleStreamResponseWithIDs(w, upstreamReq, chatID, authToken, req.Model, startTime)
 	} else {
-		handleNonStreamResponseWithIDs(w, upstreamReq, chatID, authToken)
+		handleNonStreamResponseWithIDs(w, upstreamReq, chatID, authToken, req.Model, startTime)
 	}
 }
 
 func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, authToken string) (*http.Response, error) {
-	reqBody, err := json.Marshal(upstreamReq)
-	if err != nil {
+	// 创建带超时的上下文
+	ctx, cancel := context.WithTimeout(context.Background(), 55*time.Second)
+	defer cancel()
+	// 使用对象池减少内存分配
+	buf := bytesBufferPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		bytesBufferPool.Put(buf)
+	}()
+
+	if err := json.NewEncoder(buf).Encode(upstreamReq); err != nil {
 		debugLog("上游请求序列化失败: %v", err)
 		return nil, err
 	}
 
 	debugLog("调用上游API: %s", UpstreamUrl)
-	debugLog("上游请求体: %s", string(reqBody))
+	debugLog("上游请求体: %s", buf.String())
 
-	req, err := http.NewRequest("POST", UpstreamUrl, bytes.NewBuffer(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", UpstreamUrl, bytes.NewReader(buf.Bytes()))
 	if err != nil {
 		debugLog("创建HTTP请求失败: %v", err)
 		return nil, err
@@ -656,7 +784,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	return resp, nil
 }
 
-func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string) {
+func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string, model string, startTime time.Time) {
 	debugLog("开始处理流式响应 (chat_id=%s)", chatID)
 
 	resp, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
@@ -712,6 +840,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 
 	// 标记是否已发送最初的 answer 片段（来自 EditContent）
 	var sentInitialAnswer bool
+	var lastUsage map[string]interface{}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -726,7 +855,10 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 			continue
 		}
 
-		debugLog("收到SSE数据 (第%d行): %s", lineCount, dataStr)
+		// 只记录重要的SSE事件，避免日志噪音
+	if lineCount%20 == 1 || strings.Contains(dataStr, "done") || strings.Contains(dataStr, "error") {
+		debugLog("处理SSE数据 (第%d行)", lineCount)
+	}
 
 		var upstreamData UpstreamData
 		if err := json.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
@@ -759,27 +891,33 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 			break
 		}
 
-		debugLog("解析成功 - 类型: %s, 阶段: %s, 内容长度: %d, 完成: %v",
-			upstreamData.Type, upstreamData.Data.Phase, len(upstreamData.Data.DeltaContent), upstreamData.Data.Done)
+		// 记录usage信息
+		if upstreamData.Data.Usage.TotalTokens > 0 {
+			lastUsage = map[string]interface{}{
+				"prompt_tokens":     upstreamData.Data.Usage.PromptTokens,
+				"completion_tokens": upstreamData.Data.Usage.CompletionTokens,
+				"total_tokens":      upstreamData.Data.Usage.TotalTokens,
+			}
+		}
+
+		// 只记录重要阶段变化，减少噪音
+		if upstreamData.Data.Phase == "thinking" || upstreamData.Data.Done {
+			debugLog("阶段变更 - 类型: %s, 阶段: %s, 内容长度: %d, 完成: %v",
+				upstreamData.Type, upstreamData.Data.Phase, len(upstreamData.Data.DeltaContent), upstreamData.Data.Done)
+		}
 
 		// 策略2：总是展示thinking + answer
 		// 处理EditContent在最初的answer信息（只发送一次）
 		if !sentInitialAnswer && upstreamData.Data.EditContent != "" && upstreamData.Data.Phase == "answer" {
 			var out = upstreamData.Data.EditContent
 			if out != "" {
-				var parts = regexp.MustCompile(`\</details\>`).Split(out, -1)
+				var parts = detailsSplitRegex.Split(out, -1)
 				if len(parts) > 1 {
 					var content = parts[1]
 					if content != "" {
 						debugLog("发送普通内容: %s", content)
 						// "chatcmpl" 是 OpenAI API 的标准 ID 前缀（chat completion 的缩写）
-						chunk := OpenAIResponse{
-							ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-							Object:  "chat.completion.chunk",
-							Created: time.Now().Unix(),
-							Model:   DefaultModelName,
-							Choices: []Choice{{Index: 0, Delta: Delta{Content: content}}},
-						}
+						chunk := createSSEChunk(content, false)
 						writeSSEChunk(w, chunk)
 						flusher.Flush()
 						sentInitialAnswer = true
@@ -796,18 +934,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 				if out != "" {
 					debugLog("发送思考内容: %s", out)
 					// "chatcmpl" 是 OpenAI API 的标准 ID 前缀（chat completion 的缩写）
-					chunk := OpenAIResponse{
-						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-						Object:  "chat.completion.chunk",
-						Created: time.Now().Unix(),
-						Model:   DefaultModelName,
-						Choices: []Choice{
-							{
-								Index: 0,
-								Delta: Delta{ReasoningContent: out},
-							},
-						},
-					}
+					chunk := createSSEChunk(out, true)
 					writeSSEChunk(w, chunk)
 					flusher.Flush()
 				}
@@ -816,18 +943,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 				if out != "" {
 					debugLog("发送普通内容: %s", out)
 					// "chatcmpl" 是 OpenAI API 的标准 ID 前缀（chat completion 的缩写）
-					chunk := OpenAIResponse{
-						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-						Object:  "chat.completion.chunk",
-						Created: time.Now().Unix(),
-						Model:   DefaultModelName,
-						Choices: []Choice{
-							{
-								Index: 0,
-								Delta: Delta{Content: out},
-							},
-						},
-					}
+					chunk := createSSEChunk(out, false)
 					writeSSEChunk(w, chunk)
 					flusher.Flush()
 				}
@@ -859,6 +975,8 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			debugLog("流式响应完成，共处理%d行", lineCount)
+			// 记录请求统计信息
+			logRequestStats(model, true, startTime, lastUsage)
 			break
 		}
 	}
@@ -868,12 +986,32 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 	}
 }
 
+// createSSEChunk 创建SSE响应块
+func createSSEChunk(content string, isReasoning bool) OpenAIResponse {
+	now := time.Now()
+	chunk := OpenAIResponse{
+		ID:      fmt.Sprintf("chatcmpl-%d", now.Unix()),
+		Object:  "chat.completion.chunk",
+		Created: now.Unix(),
+		Model:   DefaultModelName,
+		Choices: []Choice{{Index: 0}},
+	}
+
+	if isReasoning {
+		chunk.Choices[0].Delta = Delta{ReasoningContent: content}
+	} else {
+		chunk.Choices[0].Delta = Delta{Content: content}
+	}
+
+	return chunk
+}
+
 func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
 	data, _ := json.Marshal(chunk)
 	fmt.Fprintf(w, "data: %s\n\n", data)
 }
 
-func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string) {
+func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequest, chatID string, authToken string, model string, startTime time.Time) {
 	debugLog("开始处理非流式响应 (chat_id=%s)", chatID)
 
 	resp, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
@@ -896,7 +1034,13 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 	}
 
 	// 收集完整响应（策略2：thinking与answer都纳入，thinking转换）
-	var fullContent strings.Builder
+	// 使用对象池减少内存分配
+	sb := stringBuilderPool.Get().(*strings.Builder)
+	defer func() {
+		sb.Reset()
+		stringBuilderPool.Put(sb)
+	}()
+	fullContent := sb
 	scanner := bufio.NewScanner(resp.Body)
 	debugLog("开始收集完整响应内容")
 
@@ -962,4 +1106,12 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 	debugLog("非流式响应发送完成")
+	
+	// 记录请求统计信息
+	var usage map[string]interface{}
+	if fullContent.Len() > 0 {
+		// 非流式响应没有直接的usage信息，可以估算或留空
+		usage = map[string]interface{}{"content_length": fullContent.Len()}
+	}
+	logRequestStats(model, false, startTime, usage)
 }
