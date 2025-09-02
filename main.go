@@ -8,24 +8,37 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 )
 
-// 配置常量
+// getEnv 获取环境变量值，如果不存在则返回默认值
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// 配置变量 - 从环境变量读取敏感信息，其他保持常量
+var (
+	UpstreamUrl   = getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions")
+	DefaultKey    = getEnv("API_KEY", "sk-tbkFoKzk9a531YyUNNF5")
+	UpstreamToken = getEnv("UPSTREAM_TOKEN", "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ")
+	Port          = getEnv("PORT", ":8080")
+	DebugMode     = getEnv("DEBUG_MODE", "true") == "true"
+)
+
+// 模型常量
 const (
-	UpstreamUrl       = "https://chat.z.ai/api/chat/completions"
-	DefaultKey        = "sk-tbkFoKzk9a531YyUNNF5"                                                                                                                                                                                                                        // 下游客户端鉴权key
-	UpstreamToken     = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ" // 上游API的token（回退用）
 	DefaultModelName  = "glm-4.5"
 	ThinkingModelName = "glm-4.5-thinking"
 	SearchModelName   = "glm-4.5-search"
 	GLMAirModelName   = "glm-4.5-air"
 	GLMFlashModelName = "glm-4.5-flash"
 	GLMVision         = "glm-4.5v"
-	Port              = ":8080"
-	DebugMode         = true // debug模式开关
 )
 
 // ThinkTagsMode 思考内容处理策略
@@ -45,6 +58,18 @@ const (
 
 // AnonTokenEnabled 匿名token开关
 const AnonTokenEnabled = true
+
+// 全局HTTP客户端（连接池复用）
+var (
+	httpClient = &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+)
 
 // OpenAIRequest OpenAI 请求结构
 type OpenAIRequest struct {
@@ -158,9 +183,39 @@ func debugLog(format string, args ...interface{}) {
 	}
 }
 
+// transformThinking 转换思考内容
+func transformThinking(s string) string {
+	// 去 <summary>…</summary>
+	s = regexp.MustCompile(`(?s)<summary>.*?</summary>`).ReplaceAllString(s, "")
+	// 清理残留自定义标签，如 </thinking>、<Full> 等
+	s = strings.ReplaceAll(s, "</thinking>", "")
+	s = strings.ReplaceAll(s, "<Full>", "")
+	s = strings.ReplaceAll(s, "</Full>", "")
+	s = strings.TrimSpace(s)
+	switch ThinkTagsMode {
+	case "think":
+		s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "<think>")
+		s = strings.ReplaceAll(s, "</details>", "</think>")
+	case "strip":
+		s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "")
+		s = strings.ReplaceAll(s, "</details>", "")
+	}
+	// 处理每行前缀 "> "（包括起始位置）
+	s = strings.TrimPrefix(s, "> ")
+	s = strings.ReplaceAll(s, "\n> ", "\n")
+	return strings.TrimSpace(s)
+}
+
+// handleError 统一错误处理
+func handleError(w http.ResponseWriter, statusCode int, message string, logMsg string, args ...interface{}) {
+	if logMsg != "" {
+		debugLog(logMsg, args...)
+	}
+	http.Error(w, message, statusCode)
+}
+
 // 获取匿名token（每次对话使用不同token，避免共享记忆）
 func getAnonymousToken() (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", OriginBase+"/api/v1/auths/", nil)
 	if err != nil {
 		return "", err
@@ -176,7 +231,7 @@ func getAnonymousToken() (string, error) {
 	req.Header.Set("Origin", OriginBase)
 	req.Header.Set("Referer", OriginBase+"/")
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -289,15 +344,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 验证API Key
 	authHeader := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		debugLog("缺少或无效的Authorization头")
-		http.Error(w, "Missing or invalid Authorization header", http.StatusUnauthorized)
+		handleError(w, http.StatusUnauthorized, "Missing or invalid Authorization header", "缺少或无效的Authorization头")
 		return
 	}
 
 	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
 	if apiKey != DefaultKey {
-		debugLog("无效的API key: %s", apiKey)
-		http.Error(w, "Invalid API key", http.StatusUnauthorized)
+		handleError(w, http.StatusUnauthorized, "Invalid API key", "无效的API key: %s", apiKey)
 		return
 	}
 
@@ -306,8 +359,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 解析请求
 	var req OpenAIRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		debugLog("JSON解析失败: %v", err)
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		handleError(w, http.StatusBadRequest, "Invalid JSON", "JSON解析失败: %v", err)
 		return
 	}
 
@@ -428,8 +480,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	req.Header.Set("Origin", OriginBase)
 	req.Header.Set("Referer", OriginBase+"/c/"+refererChatID)
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		debugLog("上游请求失败: %v", err)
 		return nil, err
@@ -444,8 +495,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 
 	resp, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
 	if err != nil {
-		debugLog("调用上游失败: %v", err)
-		http.Error(w, "Failed to call upstream", http.StatusBadGateway)
+		handleError(w, http.StatusBadGateway, "Failed to call upstream", "调用上游失败: %v", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -461,28 +511,6 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 		return
 	}
 
-	// 用于策略2：总是展示thinking（配合标签处理）
-	transformThinking := func(s string) string {
-		// 去 <summary>…</summary>
-		s = regexp.MustCompile(`(?s)<summary>.*?</summary>`).ReplaceAllString(s, "")
-		// 清理残留自定义标签，如 </thinking>、<Full> 等
-		s = strings.ReplaceAll(s, "</thinking>", "")
-		s = strings.ReplaceAll(s, "<Full>", "")
-		s = strings.ReplaceAll(s, "</Full>", "")
-		s = strings.TrimSpace(s)
-		switch ThinkTagsMode {
-		case "think":
-			s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "<think>")
-			s = strings.ReplaceAll(s, "</details>", "</think>")
-		case "strip":
-			s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "")
-			s = strings.ReplaceAll(s, "</details>", "")
-		}
-		// 处理每行前缀 "> "（包括起始位置）
-		s = strings.TrimPrefix(s, "> ")
-		s = strings.ReplaceAll(s, "\n> ", "\n")
-		return strings.TrimSpace(s)
-	}
 
 	// 设置SSE头部
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -491,7 +519,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamRequ
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		handleError(w, http.StatusInternalServerError, "Streaming unsupported", "")
 		return
 	}
 
@@ -726,25 +754,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, upstreamReq UpstreamR
 		if upstreamData.Data.DeltaContent != "" {
 			out := upstreamData.Data.DeltaContent
 			if upstreamData.Data.Phase == "thinking" {
-				out = func(s string) string {
-					// 同步一份转换逻辑（与流式一致）
-					s = regexp.MustCompile(`(?s)<summary>.*?</summary>`).ReplaceAllString(s, "")
-					s = strings.ReplaceAll(s, "</thinking>", "")
-					s = strings.ReplaceAll(s, "<Full>", "")
-					s = strings.ReplaceAll(s, "</Full>", "")
-					s = strings.TrimSpace(s)
-					switch ThinkTagsMode {
-					case "think":
-						s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "<think>")
-						s = strings.ReplaceAll(s, "</details>", "</think>")
-					case "strip":
-						s = regexp.MustCompile(`<details[^>]*>`).ReplaceAllString(s, "")
-						s = strings.ReplaceAll(s, "</details>", "")
-					}
-					s = strings.TrimPrefix(s, "> ")
-					s = strings.ReplaceAll(s, "\n> ", "\n")
-					return strings.TrimSpace(s)
-				}(out)
+				out = transformThinking(out)
 			}
 			if out != "" {
 				fullContent.WriteString(out)
