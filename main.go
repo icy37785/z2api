@@ -79,8 +79,24 @@ type OpenAIRequest struct {
 	MaxTokens   int       `json:"max_tokens,omitempty"`
 }
 
-// Message 消息结构
+// ContentPart 内容部分结构（用于多模态消息）
+type ContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL *struct {
+		URL string `json:"url"`
+	} `json:"image_url,omitempty"`
+}
+
+// Message 消息结构（支持多模态内容）
 type Message struct {
+	Role             string      `json:"role"`
+	Content          interface{} `json:"content"` // 支持 string 或 []ContentPart
+	ReasoningContent string      `json:"reasoning_content,omitempty"`
+}
+
+// UpstreamMessage 上游消息结构（简化格式，仅支持字符串内容）
+type UpstreamMessage struct {
 	Role             string `json:"role"`
 	Content          string `json:"content"`
 	ReasoningContent string `json:"reasoning_content,omitempty"`
@@ -90,7 +106,7 @@ type Message struct {
 type UpstreamRequest struct {
 	Stream          bool                   `json:"stream"`
 	Model           string                 `json:"model"`
-	Messages        []Message              `json:"messages"`
+	Messages        []UpstreamMessage      `json:"messages"`
 	Params          map[string]interface{} `json:"params"`
 	Features        map[string]interface{} `json:"features"`
 	BackgroundTasks map[string]bool        `json:"background_tasks,omitempty"`
@@ -173,6 +189,46 @@ type Model struct {
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
+}
+
+// extractTextContent 从多模态内容中提取文本
+func extractTextContent(content interface{}) string {
+	switch v := content.(type) {
+	case string:
+		// 简单文本内容
+		return v
+	case []interface{}:
+		// 多模态内容数组
+		var textParts []string
+		for _, part := range v {
+			if partMap, ok := part.(map[string]interface{}); ok {
+				if partType, hasType := partMap["type"].(string); hasType && partType == "text" {
+					if text, hasText := partMap["text"].(string); hasText {
+						textParts = append(textParts, text)
+					}
+				}
+			}
+		}
+		return strings.Join(textParts, " ")
+	default:
+		// 其他类型，尝试转换为字符串
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// normalizeMessage 规范化消息格式，将多模态内容转换为上游可接受的格式
+func normalizeMessage(msg Message) UpstreamMessage {
+	// 对于上游API，我们提取文本内容并保持简单格式
+	textContent := ""
+	if msg.Content != nil {
+		textContent = extractTextContent(msg.Content)
+	}
+	
+	return UpstreamMessage{
+		Role:             msg.Role,
+		Content:          textContent,
+		ReasoningContent: msg.ReasoningContent,
+	}
 }
 
 // debug日志函数
@@ -396,13 +452,19 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		debugLog("未知模型: %s, 使用默认处理", req.Model)
 	}
 
+	// 规范化消息格式（处理多模态内容）
+	normalizedMessages := make([]UpstreamMessage, len(req.Messages))
+	for i, msg := range req.Messages {
+		normalizedMessages[i] = normalizeMessage(msg)
+	}
+
 	// 构造上游请求
 	upstreamReq := UpstreamRequest{
 		Stream:   true, // 总是使用流式从上游获取
 		ChatID:   chatID,
 		ID:       msgID,
 		Model:    modelID, // 上游实际模型ID
-		Messages: req.Messages,
+		Messages: normalizedMessages,
 		Params:   map[string]interface{}{},
 		Features: map[string]interface{}{
 			"enable_thinking": isThing,
