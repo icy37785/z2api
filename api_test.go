@@ -1,0 +1,199 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"z2api/config"
+)
+
+func TestMain(m *testing.M) {
+	// 设置必要的环境变量
+	os.Setenv("UPSTREAM_TOKEN", "test-token")
+	os.Setenv("API_KEY", "test-key")
+	os.Setenv("PORT", "8080")
+	os.Setenv("DEBUG_MODE", "true")
+	os.Setenv("THINK_TAGS_MODE", "strip")
+	os.Setenv("ANON_TOKEN_ENABLED", "false")
+	os.Setenv("MAX_CONCURRENT_REQUESTS", "100")
+
+	// 运行测试
+	exitCode := m.Run()
+	os.Exit(exitCode)
+}
+
+func TestChatCompletions(t *testing.T) {
+	// 创建一个模拟的上游服务器
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"glm-4.5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}")
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"glm-4.5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}")
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "data: [DONE]")
+		fmt.Fprintln(w, "")
+	}))
+	defer mockUpstream.Close()
+
+	// Setup
+	os.Setenv("UPSTREAM_URL", mockUpstream.URL)
+	if err := config.LoadModels("models.json"); err != nil {
+		t.Fatalf("failed to load models.json: %v", err)
+	}
+	if err := config.LoadFingerprints("fingerprints.json"); err != nil {
+		t.Logf("warning: failed to load fingerprints.json: %v", err)
+	}
+	var err error
+	appConfig, err = loadConfig()
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	concurrencyLimiter = make(chan struct{}, appConfig.MaxConcurrentRequests)
+
+	// ... (rest of the test cases are the same)
+	testCases := []struct {
+		name           string
+		requestBody    OpenAIRequest
+		expectedStatus int
+	}{
+		{
+			name: "Basic Request",
+			requestBody: OpenAIRequest{
+				Model: "glm-4.5",
+				Messages: []Message{
+					{Role: "user", Content: "Hello"},
+				},
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "Streaming Request",
+			requestBody: OpenAIRequest{
+				Model: "glm-4.5",
+				Messages: []Message{
+					{Role: "user", Content: "Hello"},
+				},
+				Stream: true,
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "Tool Choice Request",
+			requestBody: OpenAIRequest{
+				Model: "glm-4.5",
+				Messages: []Message{
+					{Role: "user", Content: "What's the weather like in Boston?"},
+				},
+				Tools: []Tool{
+					{
+						Type: "function",
+						Function: ToolFunction{
+							Name:        "get_current_weather",
+							Description: "Get the current weather in a given location",
+							Parameters: map[string]interface{}{
+								"type": "object",
+								"properties": map[string]interface{}{
+									"location": map[string]interface{}{
+										"type":        "string",
+										"description": "The city and state, e.g. San Francisco, CA",
+									},
+									"unit": map[string]interface{}{
+										"type": "string",
+										"enum": []string{"celsius", "fahrenheit"},
+									},
+								},
+								"required": []string{"location"},
+							},
+						},
+					},
+				},
+				ToolChoice: "auto",
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "Multimodal Request",
+			requestBody: OpenAIRequest{
+				Model: "glm-4.5v",
+				Messages: []Message{
+					{
+						Role: "user",
+						Content: []ContentPart{
+							{Type: "text", Text: "What's in this image?"},
+							{
+								Type: "image_url",
+								ImageURL: &ImageURL{
+									URL: "data:image/jpeg;base64,...",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedStatus: http.StatusOK,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(tc.requestBody)
+			req, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewBuffer(body))
+			req.Header.Set("Authorization", "Bearer "+appConfig.DefaultKey)
+			rr := httptest.NewRecorder()
+			handler := http.HandlerFunc(handleChatCompletions)
+			handler.ServeHTTP(rr, req)
+
+			if status := rr.Code; status != tc.expectedStatus {
+				t.Errorf("handler returned wrong status code: got %v want %v",
+					status, tc.expectedStatus)
+			}
+		})
+	}
+}
+
+func TestToolChoiceParsing(t *testing.T) {
+	// Test string format
+	choice1 := parseToolChoice("auto")
+	if choice1 == nil || choice1.Type != "auto" {
+		t.Errorf("Expected 'auto', got %+v", choice1)
+	}
+
+	// Test object format
+	choice2 := parseToolChoice(map[string]interface{}{
+		"type": "function",
+		"function": map[string]interface{}{
+			"name": "get_current_weather",
+		},
+	})
+	if choice2 == nil || choice2.Type != "function" || choice2.Function.Name != "get_current_weather" {
+		t.Errorf("Expected function with name get_current_weather, got %+v", choice2)
+	}
+
+	// Test nil input
+	choice3 := parseToolChoice(nil)
+	if choice3 != nil {
+		t.Errorf("Expected nil, got %+v", choice3)
+	}
+}
+
+func TestExtractTextContent(t *testing.T) {
+	// Test string input
+	result1 := extractTextContent("Hello World")
+	if result1 != "Hello World" {
+		t.Errorf("Expected 'Hello World', got '%s'", result1)
+	}
+
+	// Test []ContentPart input
+	contentParts := []ContentPart{
+		{Type: "text", Text: "Hello"},
+		{Type: "text", Text: "World"},
+	}
+	result2 := extractTextContent(contentParts)
+	if result2 != "Hello World " {
+		t.Errorf("Expected 'Hello World ', got '%s'", result2)
+	}
+}
