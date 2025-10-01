@@ -285,9 +285,9 @@ type ToolCallFunction struct {
 
 // ToolCall 工具调用结构
 type ToolCall struct {
-	Index    int             `json:"index"`
-	ID       string          `json:"id,omitempty"`
-	Type     string          `json:"type,omitempty"`
+	Index    int              `json:"index"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type,omitempty"`
 	Function ToolCallFunction `json:"function,omitempty"`
 }
 
@@ -307,27 +307,27 @@ func (h *SSEToolCallHandler) process(deltaContent string) ([]ToolCall, error) {
 	// 使用正则表达式匹配工具调用的各个部分
 	// 匹配工具调用的开始：{"index": <int>, "id": "<id>", "type": "function", "function": {"name": "<name>", "arguments": ""
 	toolCallStartRegex := regexp.MustCompile(`\{"index":\s*(\d+),\s*"id":\s*"([^"]+)",\s*"type":\s*"function",\s*"function":\s*\{"name":\s*"([^"]+)",\s*"arguments":\s*"([^"]*)`)
-	
+
 	// 匹配参数的增量更新："arguments": "<chunk>"
 	argUpdateRegex := regexp.MustCompile(`"arguments":\s*"([^"]*)`)
-	
+
 	// 查找所有可能的工具调用开始
 	startMatches := toolCallStartRegex.FindAllStringSubmatch(deltaContent, -1)
-	
+
 	for _, match := range startMatches {
 		if len(match) < 5 {
 			continue
 		}
-		
+
 		index, err := strconv.Atoi(match[1])
 		if err != nil {
 			continue
 		}
-		
+
 		id := match[2]
 		name := match[3]
 		args := match[4]
-		
+
 		// 检查是否已存在该索引的工具调用
 		found := false
 		for i, toolCall := range h.ToolCalls {
@@ -338,7 +338,7 @@ func (h *SSEToolCallHandler) process(deltaContent string) ([]ToolCall, error) {
 				break
 			}
 		}
-		
+
 		// 如果不存在，则创建新的工具调用
 		if !found {
 			newToolCall := ToolCall{
@@ -353,14 +353,14 @@ func (h *SSEToolCallHandler) process(deltaContent string) ([]ToolCall, error) {
 			h.ToolCalls = append(h.ToolCalls, newToolCall)
 		}
 	}
-	
+
 	// 处理参数更新（不包含工具调用开始的情况）
 	argMatches := argUpdateRegex.FindAllStringSubmatch(deltaContent, -1)
 	for _, match := range argMatches {
 		if len(match) < 2 {
 			continue
 		}
-		
+
 		args := match[1]
 		// 如果没有找到工具调用开始，但有参数更新，假设是更新最后一个工具调用
 		if len(h.ToolCalls) > 0 && len(startMatches) == 0 {
@@ -368,7 +368,7 @@ func (h *SSEToolCallHandler) process(deltaContent string) ([]ToolCall, error) {
 			h.ToolCalls[lastIndex].Function.Arguments += args
 		}
 	}
-	
+
 	return h.ToolCalls, nil
 }
 
@@ -1115,6 +1115,26 @@ func handleAPIError(w http.ResponseWriter, statusCode int, errorType string, mes
 	json.NewEncoder(w).Encode(errorResponse)
 }
 
+// handleUpstreamError 统一处理上游错误响应
+func handleUpstreamError(w http.ResponseWriter, err *UpstreamError, debugMode bool) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+
+	errorResponse := map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": err.Detail,
+			"type":    "upstream_error",
+			"code":    err.Code,
+		},
+	}
+
+	if debugMode {
+		errorResponse["error"].(map[string]interface{})["debug"] = err.Detail
+	}
+
+	json.NewEncoder(w).Encode(errorResponse)
+}
+
 // 获取匿名token（每次对话使用不同token，避免共享记忆）
 // GetToken 从缓存或新获取Token
 func (tc *TokenCache) GetToken() (string, error) {
@@ -1143,7 +1163,7 @@ func (tc *TokenCache) GetToken() (string, error) {
 	if err == nil {
 		tc.token = newToken
 		tc.expiresAt = time.Now().Add(5 * time.Minute) // 5分钟缓存
-		debugLog("获取新的匿名token成功，缓存到30分钟")
+		debugLog("获取新的匿名token成功，缓存到5分钟")
 	} else {
 		debugLog("获取新的匿名token失败: %v", err)
 	}
@@ -1790,7 +1810,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	lineCount := 0
 	var lastUsage map[string]interface{}
 	var sentInitialAnswer bool
-	
+
 	// 创建工具调用处理器
 	toolCallHandler := &SSEToolCallHandler{}
 
@@ -1876,7 +1896,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 
 		if upstreamData.Data.DeltaContent != "" {
 			var out = upstreamData.Data.DeltaContent
-			
+
 			// 处理工具调用
 			if upstreamData.Data.Phase == "tool_call" {
 				// 使用工具调用处理器处理增量内容
@@ -2154,17 +2174,8 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 
 	// 检查是否有错误发生
 	if upstreamError != nil {
-		// 返回错误响应
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		errorResponse := map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": upstreamError.Detail,
-				"type":    "upstream_error",
-				"code":    upstreamError.Code,
-			},
-		}
-		json.NewEncoder(w).Encode(errorResponse)
+		// 使用统一的错误处理函数
+		handleUpstreamError(w, upstreamError, appConfig.DebugMode)
 		debugLog("非流式错误响应发送完成: %s", upstreamError.Detail)
 	} else {
 		// 构造完整响应
@@ -2184,9 +2195,9 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 				{
 					Index: 0,
 					Message: Message{
-						Role:       "assistant",
-						Content:    "", // 工具调用时内容为空
-						ToolCalls:  finalToolCalls,
+						Role:      "assistant",
+						Content:   "", // 工具调用时内容为空
+						ToolCalls: finalToolCalls,
 					},
 					FinishReason: "tool_calls",
 				},
