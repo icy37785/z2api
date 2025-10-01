@@ -1134,57 +1134,54 @@ func getAnonymousToken() (string, error) {
 	return tokenCache.GetToken()
 }
 
-// generateBrowserHeaders 生成动态浏览器头部
-func generateBrowserHeaders(chatID string, authToken string) map[string]string {
-	headers := make(map[string]string)
+// generateBrowserHeaders generates dynamic and consistent browser headers for a session.
+func generateBrowserHeaders(sessionID, chatID, authToken, scenario string) map[string]string {
+	fp, ok := config.GetFingerprintForSession(sessionID)
+	var dynamicHeaders map[string]string
 
-	// 尝试从指纹池中获取随机指纹
-	if fp, ok := config.GetRandomFingerprint(); ok {
-		debugLog("使用从 fingerprints.json 加载的随机指纹")
-		headers["User-Agent"] = fp.UserAgent
-		headers["sec-ch-ua"] = fp.SecChUa
-		headers["sec-ch-ua-mobile"] = fp.SecChUaMobile
-		headers["sec-ch-ua-platform"] = fp.SecChUaPlatform
-		headers["X-FE-Version"] = fp.XFeVersion
-	} else {
+	if !ok {
 		debugLog("未能从 fingerprints.json 加载指纹，回退到默认硬编码指纹")
-		// 回退到原有的动态生成逻辑，但使用定义的默认常量作为基础
-		// 注意：这里的动态生成逻辑与原始版本略有不同，原始版本是基于时间戳动态生成版本号
-		// 为了简化回退逻辑，这里直接使用默认常量，或者可以保留原有的动态生成版本号逻辑
-		// 为了更贴近原始回退的“动态”特性，我们保留一部分动态生成逻辑
-		chromeVersion := 128 + (time.Now().UnixNano() % 3) // 128-130
+		// Fallback to old logic if fingerprint system fails
+		headers := make(map[string]string)
+		chromeVersion := 128 + (time.Now().UnixNano() % 3)
 		edgeVersion := chromeVersion
-
 		userAgents := []string{
 			fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36 Edg/%d.0.0.0", chromeVersion, edgeVersion),
 			fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", chromeVersion),
-			fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", chromeVersion),
 		}
-		platforms := []string{"\"Windows\"", "\"macOS\"", "\"Linux\""}
-		randomUA := userAgents[time.Now().UnixNano()%int64(len(userAgents))]
-		randomPlatform := platforms[time.Now().UnixNano()%int64(len(platforms))]
-
-		headers["User-Agent"] = randomUA
+		platforms := []string{"\"Windows\"", "\"macOS\""}
+		headers["User-Agent"] = userAgents[time.Now().UnixNano()%int64(len(userAgents))]
 		headers["sec-ch-ua"] = fmt.Sprintf(`"Chromium";v="%d", "Not(A:Brand";v="24", "Microsoft Edge";v="%d"`, chromeVersion, edgeVersion)
-		headers["sec-ch-ua-mobile"] = DefaultSecChUaMob // 使用默认常量
-		headers["sec-ch-ua-platform"] = randomPlatform
-		headers["X-FE-Version"] = DefaultXFeVersion // 使用默认常量
+		headers["sec-ch-ua-mobile"] = DefaultSecChUaMob
+		headers["sec-ch-ua-platform"] = platforms[time.Now().UnixNano()%int64(len(platforms))]
+		headers["X-FE-Version"] = DefaultXFeVersion
+		dynamicHeaders = headers
+	} else {
+		debugLog("使用会话指纹 (ID: %s) for chatID: %s", fp.ID, chatID)
+		switch scenario {
+		case "xhr":
+			dynamicHeaders = fp.Headers.XHR
+		case "js":
+			dynamicHeaders = fp.Headers.JS
+		default: // Default to "html"
+			dynamicHeaders = fp.Headers.HTML
+		}
+		dynamicHeaders["User-Agent"] = fp.UserAgent
 	}
 
-	// 设置通用请求头
-	headers["Content-Type"] = "application/json"
-	headers["Accept"] = "*/*"
-	headers["Authorization"] = "Bearer " + authToken
-	headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"
-	headers["Accept-Encoding"] = "gzip, deflate, br, zstd"
-	headers["sec-fetch-dest"] = "empty"
-	headers["sec-fetch-mode"] = "cors"
-	headers["sec-fetch-site"] = "same-origin"
-	headers["Origin"] = OriginBase
-	headers["Referer"] = OriginBase + "/c/" + chatID
-	headers["Priority"] = "u=1, i"
+	// Set common headers
+	dynamicHeaders["Accept"] = "*/*"
+	dynamicHeaders["Authorization"] = "Bearer " + authToken
+	dynamicHeaders["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"
+	dynamicHeaders["Accept-Encoding"] = "gzip, deflate, br, zstd"
+	dynamicHeaders["sec-fetch-dest"] = "empty"
+	dynamicHeaders["sec-fetch-mode"] = "cors"
+	dynamicHeaders["sec-fetch-site"] = "same-origin"
+	dynamicHeaders["Origin"] = OriginBase
+	dynamicHeaders["Referer"] = OriginBase + "/c/" + chatID
+	dynamicHeaders["Priority"] = "u=1, i"
 
-	return headers
+	return dynamicHeaders
 }
 
 // getAnonymousTokenDirect 直接获取匿名token（原始方法，不使用缓存）
@@ -1199,7 +1196,7 @@ func getAnonymousTokenDirect() (string, error) {
 		return "", err
 	}
 	// 使用动态指纹
-	headers := generateBrowserHeaders("", "")
+	headers := generateBrowserHeaders("", "", "", "html")
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
@@ -1526,6 +1523,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
 
+	// 为指纹会话生成会话ID
+	var sessionID string
+	if req.User != "" {
+		sessionID = req.User
+	} else {
+		sessionID = getClientIP(r)
+	}
+
 	// 生成会话相关ID - 优化时间戳获取
 	now := time.Now()
 	chatID := fmt.Sprintf("%d-%d", now.UnixNano(), now.Unix())
@@ -1617,13 +1622,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 调用上游API
 	if req.Stream {
-		handleStreamResponseWithIDs(w, r, upstreamReq, chatID, authToken, modelName, startTime)
+		handleStreamResponseWithIDs(w, r, upstreamReq, chatID, authToken, modelName, startTime, sessionID)
 	} else {
-		handleNonStreamResponseWithIDs(w, r, upstreamReq, chatID, authToken, modelName, startTime)
+		handleNonStreamResponseWithIDs(w, r, upstreamReq, chatID, authToken, modelName, startTime, sessionID)
 	}
 }
 
-func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, authToken string) (*http.Response, context.CancelFunc, error) {
+func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
 	// 创建带超时的上下文 - 增加超时时间 for SSE streams
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 
@@ -1651,7 +1656,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	}
 
 	// 使用动态指纹
-	headers := generateBrowserHeaders(refererChatID, authToken)
+	headers := generateBrowserHeaders(sessionID, refererChatID, authToken, "xhr")
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
@@ -1711,11 +1716,11 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	return resp, cancel, nil
 }
 
-func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time) {
+func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time, sessionID string) {
 	userAgent := r.Header.Get("User-Agent")
 	debugLog("开始处理流式响应 (chat_id=%s, model=%s)", chatID, upstreamReq.Model)
 
-	resp, cancel, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
+	resp, cancel, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken, sessionID)
 	if err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, true)
@@ -1817,6 +1822,22 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			}
 			if errObj != nil {
 				debugLog("上游错误: code=%d, detail=%s", errObj.Code, errObj.Detail)
+				// 向客户端发送错误响应
+				errorChunk := OpenAIResponse{
+					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   upstreamReq.Model,
+					Choices: []Choice{
+						{
+							Index:        0,
+							Delta:        Delta{Content: ""},
+							FinishReason: "error",
+						},
+					},
+				}
+				writeSSEChunk(w, errorChunk)
+				flusher.Flush()
 			}
 			break
 		}
@@ -1925,11 +1946,11 @@ func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
 	fmt.Fprintf(w, "data: %s\n\n", data)
 }
 
-func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time) {
+func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time, sessionID string) {
 	userAgent := r.Header.Get("User-Agent")
 	debugLog("开始处理非流式响应 (chat_id=%s)", chatID)
 
-	resp, cancel, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken)
+	resp, cancel, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken, sessionID)
 	if err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, false)
@@ -1973,6 +1994,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	// 使用更健壮的扫描器方式，类似旧版本和流式响应
 	scanner := bufio.NewScanner(resp.Body)
 	lineCount := 0
+	var upstreamError *UpstreamError // 用于存储上游错误信息
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -2010,15 +2032,17 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 
 		// Check for error in upstream response
 		if (upstreamData.Error != nil) || (upstreamData.Data.Error != nil) || (upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
-			errObj := upstreamData.Error
-			if errObj == nil {
-				errObj = upstreamData.Data.Error
+			upstreamError = upstreamData.Error
+			if upstreamError == nil {
+				upstreamError = upstreamData.Data.Error
 			}
-			if errObj == nil && upstreamData.Data.Inner != nil {
-				errObj = upstreamData.Data.Inner.Error
+			if upstreamError == nil && upstreamData.Data.Inner != nil {
+				upstreamError = upstreamData.Data.Inner.Error
 			}
-			if errObj != nil {
-				debugLog("上游返回错误 (第%d行): code=%d, detail=%s", lineCount, errObj.Code, errObj.Detail)
+			if upstreamError != nil {
+				debugLog("上游返回错误 (第%d行): code=%d, detail=%s", lineCount, upstreamError.Code, upstreamError.Detail)
+				// 设置错误标志，跳出循环
+				break
 			}
 			continue
 		}
@@ -2070,29 +2094,45 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	finalContent := fullContent.String()
 	debugLog("内容收集完成，总共处理%d行，最终长度: %d", lineCount, len(finalContent))
 
-	// 构造完整响应
-	// "chatcmpl" 是 OpenAI API 的标准 ID 前缀（chat completion 的缩写）
-	response := OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-		Object:  "chat.completion",
-		Created: time.Now().Unix(),
-		Model:   upstreamReq.Model, // Use the actual upstream model instead of default
-		Choices: []Choice{
-			{
-				Index: 0,
-				Message: Message{
-					Role:    "assistant",
-					Content: finalContent,
-				},
-				FinishReason: "stop",
+	// 检查是否有错误发生
+	if upstreamError != nil {
+		// 返回错误响应
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		errorResponse := map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": upstreamError.Detail,
+				"type":    "upstream_error",
+				"code":    upstreamError.Code,
 			},
-		},
-		Usage: lastUsage,
-	}
+		}
+		json.NewEncoder(w).Encode(errorResponse)
+		debugLog("非流式错误响应发送完成: %s", upstreamError.Detail)
+	} else {
+		// 构造完整响应
+		// "chatcmpl" 是 OpenAI API 的标准 ID 前缀（chat completion 的缩写）
+		response := OpenAIResponse{
+			ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   upstreamReq.Model, // Use the actual upstream model instead of default
+			Choices: []Choice{
+				{
+					Index: 0,
+					Message: Message{
+						Role:    "assistant",
+						Content: finalContent,
+					},
+					FinishReason: "stop",
+				},
+			},
+			Usage: lastUsage,
+		}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-	debugLog("非流式响应发送完成")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+		debugLog("非流式响应发送完成")
+	}
 
 	// 记录请求统计信息
 	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
