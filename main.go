@@ -175,11 +175,8 @@ var (
 
 // 伪装前端头部（来自抓包） - now loaded from fingerprints.json
 var (
-	DefaultXFeVersion  = "prod-fe-1.0.70"
-	DefaultBrowserUa   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0"
-	DefaultSecChUa     = "\"Not;A=Brand\";v=\"99\", \"Microsoft Edge\";v=\"139\", \"Chromium\";v=\"139\""
-	DefaultSecChUaMob  = "?0"
-	DefaultSecChUaPlat = "\"Windows\""
+	DefaultXFeVersion = "prod-fe-1.0.70"
+	DefaultSecChUaMob = "?0"
 )
 
 const (
@@ -233,29 +230,10 @@ var (
 		},
 	}
 
-	openAIResponsePool = sync.Pool{
-		New: func() interface{} {
-			return &OpenAIResponse{}
-		},
-	}
-
 	// 添加更多对象池优化内存分配
 	bytesBufferPool = sync.Pool{
 		New: func() interface{} {
 			return bytes.NewBuffer(make([]byte, 0, 1024)) // 预分配1KB
-		},
-	}
-
-	upstreamRequestPool = sync.Pool{
-		New: func() interface{} {
-			return &UpstreamRequest{}
-		},
-	}
-
-	// SSE缓冲区对象池，减少大缓冲区内存占用
-	sseBufferPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 0, 8*1024) // 8KB初始缓冲区
 		},
 	}
 
@@ -554,7 +532,12 @@ func extractTextContent(content interface{}) string {
 
 // processMultimodalContent 处理全方位多模态内容，支持图像、视频、文档、音频等
 func processMultimodalContent(parts []ContentPart, model string) string {
-	var textContent strings.Builder
+	textContent := stringBuilderPool.Get().(*strings.Builder)
+	defer func() {
+		textContent.Reset()
+		stringBuilderPool.Put(textContent)
+	}()
+
 	var mediaStats = struct {
 		text      int
 		images    int
@@ -664,9 +647,6 @@ func normalizeMultimodalMessage(msg Message, model string) UpstreamMessage {
 }
 
 // normalizeMessage 规范化消息格式，将多模态内容转换为上游可接受的格式
-func normalizeMessage(msg Message, model string) UpstreamMessage {
-	return normalizeMultimodalMessage(msg, model)
-}
 
 // normalizeRole 规范化角色名称，处理OpenAI和Z.ai之间的差异
 func normalizeRole(role string) string {
@@ -818,60 +798,6 @@ func debugLog(format string, args ...interface{}) {
 	if appConfig != nil && appConfig.DebugMode {
 		log.Printf("[DEBUG] "+format, args...)
 	}
-}
-
-// infoLog 记录重要信息（不受DEBUG模式限制）
-func infoLog(format string, args ...interface{}) {
-	log.Printf("[INFO] "+format, args...)
-}
-
-// RequestMetrics 请求指标结构
-type RequestMetrics struct {
-	Model         string
-	IsStream      bool
-	Duration      time.Duration
-	TokenUsage    map[string]interface{}
-	StatusCode    int
-	ErrorType     string
-	ContentLength int64
-}
-
-// 记录请求统计信息 - 增强版
-func logRequestStats(model string, isStream bool, startTime time.Time, tokenUsage map[string]interface{}) {
-	logRequestStatsWithCode(model, isStream, startTime, tokenUsage, 200, "")
-}
-
-// logRequestStatsWithCode 记录带状态码的请求统计信息
-func logRequestStatsWithCode(model string, isStream bool, startTime time.Time, tokenUsage map[string]interface{}, statusCode int, errorType string) {
-	duration := time.Since(startTime)
-	mode := "non-streaming"
-	if isStream {
-		mode = "streaming"
-	}
-
-	// 改进的usage信息格式化 - 借鉴Worker.js
-	usageStr := "no usage info"
-	if tokenUsage != nil {
-		if prompt, hasPrompt := tokenUsage["prompt_tokens"]; hasPrompt {
-			if completion, hasCompletion := tokenUsage["completion_tokens"]; hasCompletion {
-				if total, hasTotal := tokenUsage["total_tokens"]; hasTotal {
-					usageStr = fmt.Sprintf("tokens(p:%v/c:%v/t:%v)", prompt, completion, total)
-				}
-			}
-		} else if total, ok := tokenUsage["total_tokens"]; ok {
-			usageStr = fmt.Sprintf("tokens: %v", total)
-		} else if length, ok := tokenUsage["content_length"]; ok {
-			usageStr = fmt.Sprintf("content_length: %v", length)
-		}
-	}
-
-	// 增加状态码和错误信息
-	statusInfo := fmt.Sprintf("status:%d", statusCode)
-	if errorType != "" {
-		statusInfo += fmt.Sprintf(" error:%s", errorType)
-	}
-
-	infoLog("请求完成 - 模型:%s 模式:%s 耗时:%v %s %s", model, mode, duration, statusInfo, usageStr)
 }
 
 // transformThinking 转换思考内容
@@ -1426,43 +1352,23 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 
 // getModelsList 获取模型列表，支持优雅降级
 func getModelsList() ModelsResponse {
-	// 首先尝试从上游获取模型列表（可选功能）
-	// 这里简化处理，直接返回默认列表
+	// 从配置动态生成模型列表
+	loadedModels := config.GetAllModels()
+	apiModels := make([]Model, len(loadedModels))
+	now := time.Now().Unix()
+
+	for i, m := range loadedModels {
+		apiModels[i] = Model{
+			ID:      m.ID,
+			Object:  "model",
+			Created: now,
+			OwnedBy: "z.ai",
+		}
+	}
 
 	return ModelsResponse{
 		Object: "list",
-		Data: []Model{
-			{
-				ID:      DefaultModelName,
-				Object:  "model",
-				Created: time.Now().Unix(),
-				OwnedBy: "z.ai",
-			},
-			{
-				ID:      ThinkingModelName,
-				Object:  "model",
-				Created: time.Now().Unix(),
-				OwnedBy: "z.ai",
-			},
-			{
-				ID:      SearchModelName,
-				Object:  "model",
-				Created: time.Now().Unix(),
-				OwnedBy: "z.ai",
-			},
-			{
-				ID:      GLMAirModelName,
-				Object:  "model",
-				Created: time.Now().Unix(),
-				OwnedBy: "z.ai",
-			},
-			{
-				ID:      GLMVision,
-				Object:  "model",
-				Created: time.Now().Unix(),
-				OwnedBy: "z.ai",
-			},
-		},
+		Data:   apiModels,
 	}
 }
 
@@ -1554,7 +1460,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 规范化消息格式（处理多模态内容）
 	normalizedMessages := make([]UpstreamMessage, len(req.Messages))
 	for i, msg := range req.Messages {
-		normalizedMessages[i] = normalizeMessage(msg, req.Model)
+		normalizedMessages[i] = normalizeMultimodalMessage(msg, req.Model)
 	}
 
 	// 解析ToolChoice参数，支持多种格式

@@ -75,12 +75,20 @@ func GetModelConfig(id string) (ModelConfig, bool) {
 	normalizedID := normalizeModelID(id)
 
 	config, ok := modelData.modelMap[normalizedID]
-    if !ok {
-        // 如果找不到，返回一个默认模型 (第一个)
-        if len(modelData.Models) > 0 {
-            return modelData.Models[0], false
-        }
-        return ModelConfig{}, false
-    }
+	if !ok {
+		// 如果找不到，返回一个默认模型 (第一个)
+		if len(modelData.Models) > 0 {
+			return modelData.Models[0], false
+		}
+		return ModelConfig{}, false
+	}
 	return config, true
+}
+
+// GetAllModels returns a slice of all loaded model configurations.
+func GetAllModels() []ModelConfig {
+	if modelData == nil {
+		return []ModelConfig{}
+	}
+	return modelData.Models
 }
