@@ -1136,37 +1136,55 @@ func getAnonymousToken() (string, error) {
 
 // generateBrowserHeaders 生成动态浏览器头部
 func generateBrowserHeaders(chatID string, authToken string) map[string]string {
-	chromeVersion := 128 + (time.Now().UnixNano() % 3) // 128-130
-	edgeVersion := chromeVersion
+	headers := make(map[string]string)
 
-	userAgents := []string{
-		fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36 Edg/%d.0.0.0", chromeVersion, edgeVersion),
-		fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", chromeVersion),
-		fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", chromeVersion),
+	// 尝试从指纹池中获取随机指纹
+	if fp, ok := config.GetRandomFingerprint(); ok {
+		debugLog("使用从 fingerprints.json 加载的随机指纹")
+		headers["User-Agent"] = fp.UserAgent
+		headers["sec-ch-ua"] = fp.SecChUa
+		headers["sec-ch-ua-mobile"] = fp.SecChUaMobile
+		headers["sec-ch-ua-platform"] = fp.SecChUaPlatform
+		headers["X-FE-Version"] = fp.XFeVersion
+	} else {
+		debugLog("未能从 fingerprints.json 加载指纹，回退到默认硬编码指纹")
+		// 回退到原有的动态生成逻辑，但使用定义的默认常量作为基础
+		// 注意：这里的动态生成逻辑与原始版本略有不同，原始版本是基于时间戳动态生成版本号
+		// 为了简化回退逻辑，这里直接使用默认常量，或者可以保留原有的动态生成版本号逻辑
+		// 为了更贴近原始回退的“动态”特性，我们保留一部分动态生成逻辑
+		chromeVersion := 128 + (time.Now().UnixNano() % 3) // 128-130
+		edgeVersion := chromeVersion
+
+		userAgents := []string{
+			fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36 Edg/%d.0.0.0", chromeVersion, edgeVersion),
+			fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", chromeVersion),
+			fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", chromeVersion),
+		}
+		platforms := []string{"\"Windows\"", "\"macOS\"", "\"Linux\""}
+		randomUA := userAgents[time.Now().UnixNano()%int64(len(userAgents))]
+		randomPlatform := platforms[time.Now().UnixNano()%int64(len(platforms))]
+
+		headers["User-Agent"] = randomUA
+		headers["sec-ch-ua"] = fmt.Sprintf(`"Chromium";v="%d", "Not(A:Brand";v="24", "Microsoft Edge";v="%d"`, chromeVersion, edgeVersion)
+		headers["sec-ch-ua-mobile"] = DefaultSecChUaMob // 使用默认常量
+		headers["sec-ch-ua-platform"] = randomPlatform
+		headers["X-FE-Version"] = DefaultXFeVersion // 使用默认常量
 	}
 
-	platforms := []string{"\"Windows\"", "\"macOS\"", "\"Linux\""}
-	randomUA := userAgents[time.Now().UnixNano()%int64(len(userAgents))]
-	randomPlatform := platforms[time.Now().UnixNano()%int64(len(platforms))]
+	// 设置通用请求头
+	headers["Content-Type"] = "application/json"
+	headers["Accept"] = "*/*"
+	headers["Authorization"] = "Bearer " + authToken
+	headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"
+	headers["Accept-Encoding"] = "gzip, deflate, br, zstd"
+	headers["sec-fetch-dest"] = "empty"
+	headers["sec-fetch-mode"] = "cors"
+	headers["sec-fetch-site"] = "same-origin"
+	headers["Origin"] = OriginBase
+	headers["Referer"] = OriginBase + "/c/" + chatID
+	headers["Priority"] = "u=1, i"
 
-	return map[string]string{
-		"Content-Type":       "application/json",
-		"Accept":             "*/*",
-		"User-Agent":         randomUA,
-		"Authorization":      "Bearer " + authToken,
-		"Accept-Language":    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-		"Accept-Encoding":    "gzip, deflate, br, zstd",
-		"sec-ch-ua":          fmt.Sprintf(`"Chromium";v="%d", "Not(A:Brand";v="24", "Microsoft Edge";v="%d"`, chromeVersion, edgeVersion),
-		"sec-ch-ua-mobile":   "?0",
-		"sec-ch-ua-platform": randomPlatform,
-		"sec-fetch-dest":     "empty",
-		"sec-fetch-mode":     "cors",
-		"sec-fetch-site":     "same-origin",
-		"X-FE-Version":       DefaultXFeVersion,
-		"Origin":             OriginBase,
-		"Referer":            OriginBase + "/c/" + chatID,
-		"Priority":           "u=1, i",
-	}
+	return headers
 }
 
 // getAnonymousTokenDirect 直接获取匿名token（原始方法，不使用缓存）
