@@ -277,6 +277,101 @@ func (br *brotliReadCloser) Close() error {
 	return br.source.Close()
 }
 
+// ToolCallFunction 工具调用函数结构
+type ToolCallFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+// ToolCall 工具调用结构
+type ToolCall struct {
+	Index    int             `json:"index"`
+	ID       string          `json:"id,omitempty"`
+	Type     string          `json:"type,omitempty"`
+	Function ToolCallFunction `json:"function,omitempty"`
+}
+
+// SSEToolCallHandler SSE工具调用处理器
+type SSEToolCallHandler struct {
+	ToolCalls []ToolCall
+}
+
+// process 处理工具调用的增量内容
+func (h *SSEToolCallHandler) process(deltaContent string) ([]ToolCall, error) {
+	// 如果没有内容，直接返回当前的工具调用列表
+	if deltaContent == "" {
+		return h.ToolCalls, nil
+	}
+
+	// 尝试解析工具调用
+	// 使用正则表达式匹配工具调用的各个部分
+	// 匹配工具调用的开始：{"index": <int>, "id": "<id>", "type": "function", "function": {"name": "<name>", "arguments": ""
+	toolCallStartRegex := regexp.MustCompile(`\{"index":\s*(\d+),\s*"id":\s*"([^"]+)",\s*"type":\s*"function",\s*"function":\s*\{"name":\s*"([^"]+)",\s*"arguments":\s*"([^"]*)`)
+	
+	// 匹配参数的增量更新："arguments": "<chunk>"
+	argUpdateRegex := regexp.MustCompile(`"arguments":\s*"([^"]*)`)
+	
+	// 查找所有可能的工具调用开始
+	startMatches := toolCallStartRegex.FindAllStringSubmatch(deltaContent, -1)
+	
+	for _, match := range startMatches {
+		if len(match) < 5 {
+			continue
+		}
+		
+		index, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+		
+		id := match[2]
+		name := match[3]
+		args := match[4]
+		
+		// 检查是否已存在该索引的工具调用
+		found := false
+		for i, toolCall := range h.ToolCalls {
+			if toolCall.Index == index {
+				// 更新现有工具调用的参数
+				h.ToolCalls[i].Function.Arguments += args
+				found = true
+				break
+			}
+		}
+		
+		// 如果不存在，则创建新的工具调用
+		if !found {
+			newToolCall := ToolCall{
+				Index: index,
+				ID:    id,
+				Type:  "function",
+				Function: ToolCallFunction{
+					Name:      name,
+					Arguments: args,
+				},
+			}
+			h.ToolCalls = append(h.ToolCalls, newToolCall)
+		}
+	}
+	
+	// 处理参数更新（不包含工具调用开始的情况）
+	argMatches := argUpdateRegex.FindAllStringSubmatch(deltaContent, -1)
+	for _, match := range argMatches {
+		if len(match) < 2 {
+			continue
+		}
+		
+		args := match[1]
+		// 如果没有找到工具调用开始，但有参数更新，假设是更新最后一个工具调用
+		if len(h.ToolCalls) > 0 && len(startMatches) == 0 {
+			lastIndex := len(h.ToolCalls) - 1
+			h.ToolCalls[lastIndex].Function.Arguments += args
+		}
+	}
+	
+	return h.ToolCalls, nil
+}
+
 // ToolFunction 工具函数结构
 type ToolFunction struct {
 	Name        string                 `json:"name"`
@@ -391,6 +486,7 @@ type Message struct {
 	Role             string      `json:"role"`
 	Content          interface{} `json:"content"` // 支持 string 或 []ContentPart
 	ReasoningContent string      `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall  `json:"tool_calls,omitempty"`
 }
 
 // UpstreamMessage 上游消息结构（简化格式，仅支持字符串内容）
@@ -442,9 +538,10 @@ type Choice struct {
 
 // Delta 增量结构
 type Delta struct {
-	Role             string `json:"role,omitempty"`
-	Content          string `json:"content,omitempty"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // Usage 用量结构
@@ -464,6 +561,7 @@ type UpstreamData struct {
 		Done         bool           `json:"done"`
 		Usage        Usage          `json:"usage,omitempty"`
 		Error        *UpstreamError `json:"error,omitempty"`
+		ToolCalls    []ToolCall     `json:"tool_calls,omitempty"`
 		Inner        *struct {
 			Error *UpstreamError `json:"error,omitempty"`
 		} `json:"data,omitempty"`
@@ -1692,6 +1790,9 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	lineCount := 0
 	var lastUsage map[string]interface{}
 	var sentInitialAnswer bool
+	
+	// 创建工具调用处理器
+	toolCallHandler := &SSEToolCallHandler{}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1775,7 +1876,32 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 
 		if upstreamData.Data.DeltaContent != "" {
 			var out = upstreamData.Data.DeltaContent
-			if upstreamData.Data.Phase == "thinking" {
+			
+			// 处理工具调用
+			if upstreamData.Data.Phase == "tool_call" {
+				// 使用工具调用处理器处理增量内容
+				toolCalls, err := toolCallHandler.process(out)
+				if err == nil && len(toolCalls) > 0 {
+					// 创建包含工具调用的响应块
+					chunk := OpenAIResponse{
+						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   upstreamReq.Model,
+						Choices: []Choice{
+							{
+								Index: 0,
+								Delta: Delta{
+									Role:      "assistant",
+									ToolCalls: toolCalls,
+								},
+							},
+						},
+					}
+					writeSSEChunk(w, chunk)
+					flusher.Flush()
+				}
+			} else if upstreamData.Data.Phase == "thinking" {
 				out = transformThinking(out)
 				if out != "" {
 					chunk := createSSEChunk(out, true, upstreamReq.Model)
@@ -1792,6 +1918,19 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		}
 
 		if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
+			// 检查是否有工具调用需要完成
+			if len(toolCallHandler.ToolCalls) > 0 {
+				// 发送工具调用完成信号
+				endChunk := OpenAIResponse{
+					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   upstreamReq.Model,
+					Choices: []Choice{{Index: 0, Delta: Delta{}, FinishReason: "tool_calls"}},
+				}
+				writeSSEChunk(w, endChunk)
+				flusher.Flush()
+			}
 			break
 		}
 	}
@@ -1800,12 +1939,18 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		debugLog("扫描器错误: %v", err)
 	}
 
+	// 根据是否有工具调用决定结束原因
+	finishReason := "stop"
+	if len(toolCallHandler.ToolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+
 	endChunk := OpenAIResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 		Object:  "chat.completion.chunk",
 		Created: time.Now().Unix(),
 		Model:   upstreamReq.Model,
-		Choices: []Choice{{Index: 0, Delta: Delta{}, FinishReason: "stop"}},
+		Choices: []Choice{{Index: 0, Delta: Delta{}, FinishReason: finishReason}},
 	}
 	writeSSEChunk(w, endChunk)
 	flusher.Flush()
@@ -1893,6 +2038,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	// 收集完整响应（策略2：thinking与answer都纳入，thinking转换）
 	// 使用更健壮的方法读取SSE流，类似TypeScript版本
 	var fullContent strings.Builder
+	var finalToolCalls []ToolCall // 用于存储工具调用
 	lastUsage := Usage{}
 
 	debugLog("开始收集完整响应内容")
@@ -1955,6 +2101,12 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 
 		if upstreamData.Data.Usage.TotalTokens > 0 {
 			lastUsage = upstreamData.Data.Usage
+		}
+
+		// 检查并处理工具调用
+		if len(upstreamData.Data.ToolCalls) > 0 {
+			debugLog("检测到工具调用，数量: %d", len(upstreamData.Data.ToolCalls))
+			finalToolCalls = append(finalToolCalls, upstreamData.Data.ToolCalls...)
 		}
 
 		// Capture content from multiple possible sources to ensure we get the response
@@ -2022,7 +2174,26 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 			Object:  "chat.completion",
 			Created: time.Now().Unix(),
 			Model:   upstreamReq.Model, // Use the actual upstream model instead of default
-			Choices: []Choice{
+			Usage:   lastUsage,
+		}
+
+		// 根据是否存在工具调用来构造不同的响应
+		if len(finalToolCalls) > 0 {
+			debugLog("响应包含工具调用，数量: %d", len(finalToolCalls))
+			response.Choices = []Choice{
+				{
+					Index: 0,
+					Message: Message{
+						Role:       "assistant",
+						Content:    "", // 工具调用时内容为空
+						ToolCalls:  finalToolCalls,
+					},
+					FinishReason: "tool_calls",
+				},
+			}
+		} else {
+			debugLog("响应为普通文本内容，长度: %d", len(finalContent))
+			response.Choices = []Choice{
 				{
 					Index: 0,
 					Message: Message{
@@ -2031,8 +2202,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 					},
 					FinishReason: "stop",
 				},
-			},
-			Usage: lastUsage,
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
