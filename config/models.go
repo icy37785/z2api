@@ -66,7 +66,7 @@ func normalizeModelID(id string) string {
 	return normalizedID // 如果没有匹配的映射，返回标准化的原ID
 }
 
-// GetModelConfig 根据模型ID获取配置，如果找不到则返回默认配置
+// GetModelConfig 根据模型ID获取配置
 func GetModelConfig(id string) (ModelConfig, bool) {
 	if modelData == nil || modelData.modelMap == nil {
 		return ModelConfig{}, false // 配置未加载
@@ -75,14 +75,15 @@ func GetModelConfig(id string) (ModelConfig, bool) {
 	normalizedID := normalizeModelID(id)
 
 	config, ok := modelData.modelMap[normalizedID]
-	if !ok {
-		// 如果找不到，返回一个默认模型 (第一个)
-		if len(modelData.Models) > 0 {
-			return modelData.Models[0], false
-		}
-		return ModelConfig{}, false
+	return config, ok
+}
+
+// GetDefaultModel 获取默认模型 (列表中的第一个)
+func GetDefaultModel() (ModelConfig, bool) {
+	if modelData != nil && len(modelData.Models) > 0 {
+		return modelData.Models[0], true
 	}
-	return config, true
+	return ModelConfig{}, false
 }
 
 // GetAllModels returns a slice of all loaded model configurations.
