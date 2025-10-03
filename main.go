@@ -24,6 +24,7 @@ import (
 	"z2api/config"
 
 	"github.com/andybalholm/brotli"
+	"github.com/google/uuid"
 )
 
 // Config 配置结构体
@@ -83,6 +84,11 @@ func loadConfig() (*Config, error) {
 
 // validate 验证配置合法性
 func (c *Config) validate() error {
+	// 验证API密钥不能为空
+	if c.DefaultKey == "" {
+		return fmt.Errorf("API_KEY 环境变量是必需的，不能为空")
+	}
+
 	// 验证URL格式
 	if !strings.HasPrefix(c.UpstreamUrl, "http") {
 		return fmt.Errorf("UPSTREAM_URL 必须是有效的HTTP URL")
@@ -291,85 +297,215 @@ type ToolCall struct {
 	Function ToolCallFunction `json:"function,omitempty"`
 }
 
+// StreamingJSONParser 流式JSON解析器
+type StreamingJSONParser struct {
+	buffer     []rune     // 当前缓冲区
+	toolCalls  []ToolCall // 解析出的工具调用
+	inString   bool       // 是否在字符串中
+	escapeNext bool       // 下一个字符是否转义
+	braceCount int        // 大括号计数
+}
+
+// NewStreamingJSONParser 创建新的流式JSON解析器
+func NewStreamingJSONParser() *StreamingJSONParser {
+	return &StreamingJSONParser{
+		buffer:    make([]rune, 0, 1024),
+		toolCalls: make([]ToolCall, 0),
+	}
+}
+
+// ProcessChunk 处理JSON数据块
+func (p *StreamingJSONParser) ProcessChunk(chunk string) ([]ToolCall, error) {
+	if chunk == "" {
+		return p.toolCalls, nil
+	}
+
+	// 将字符串转换为rune切片以正确处理Unicode
+	runes := []rune(chunk)
+
+	for _, r := range runes {
+		p.processRune(r)
+	}
+
+	return p.toolCalls, nil
+}
+
+// processRune 处理单个字符
+func (p *StreamingJSONParser) processRune(r rune) {
+	// 跳过空白字符，除非已经在字符串中
+	if !p.inString && (r == ' ' || r == '\t' || r == '\n' || r == '\r') {
+		return
+	}
+
+	p.buffer = append(p.buffer, r)
+
+	// 处理转义字符
+	if p.escapeNext {
+		p.escapeNext = false
+		return
+	}
+
+	if r == '\\' && p.inString {
+		p.escapeNext = true
+		return
+	}
+
+	// 处理字符串边界
+	if r == '"' {
+		p.inString = !p.inString
+		return
+	}
+
+	// 只在非字符串中计算大括号
+	if !p.inString {
+		if r == '{' {
+			p.braceCount++
+		} else if r == '}' {
+			p.braceCount--
+			// 当大括号配对时，尝试解析
+			if p.braceCount == 0 {
+				p.tryParseObject()
+			}
+		}
+	}
+}
+
+// tryParseObject 尝试解析完整的对象
+func (p *StreamingJSONParser) tryParseObject() {
+	jsonStr := string(p.buffer)
+
+	// 尝试解析JSON
+	var toolCallData map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &toolCallData); err != nil {
+		// 解析失败，可能是JSON不完整
+		return
+	}
+
+	// 解析成功，提取工具调用信息
+	p.extractToolCall(toolCallData)
+
+	// 重置缓冲区以准备下一个工具调用
+	p.buffer = make([]rune, 0, 1024)
+}
+
+// extractToolCall 从解析的数据中提取工具调用
+func (p *StreamingJSONParser) extractToolCall(data map[string]interface{}) {
+	// 检查是否是工具调用对象
+	index, hasIndex := data["index"]
+	id, hasID := data["id"]
+	toolType, hasType := data["type"]
+	function, hasFunction := data["function"]
+
+	if !hasIndex || !hasID || !hasType || !hasFunction {
+		return
+	}
+
+	// 转换类型
+	indexFloat, ok := index.(float64)
+	if !ok {
+		return
+	}
+
+	indexInt := int(indexFloat)
+	idStr, ok := id.(string)
+	if !ok {
+		return
+	}
+
+	typeStr, ok := toolType.(string)
+	if !ok {
+		return
+	}
+
+	functionMap, ok := function.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	name, hasName := functionMap["name"]
+	arguments, hasArguments := functionMap["arguments"]
+
+	if !hasName || !hasArguments {
+		return
+	}
+
+	nameStr, ok := name.(string)
+	if !ok {
+		return
+	}
+
+	argumentsStr, ok := arguments.(string)
+	if !ok {
+		return
+	}
+
+	// 创建工具调用对象
+	toolCall := ToolCall{
+		Index: indexInt,
+		ID:    idStr,
+		Type:  typeStr,
+		Function: ToolCallFunction{
+			Name:      nameStr,
+			Arguments: argumentsStr,
+		},
+	}
+
+	// 检查是否已存在该索引的工具调用
+	found := false
+	for i, existingTool := range p.toolCalls {
+		if existingTool.Index == indexInt {
+			// 更新现有工具调用的参数
+			if len(argumentsStr) > len(existingTool.Function.Arguments) {
+				p.toolCalls[i].Function.Arguments = argumentsStr
+			}
+			found = true
+			break
+		}
+	}
+
+	// 如果不存在，则添加新的工具调用
+	if !found {
+		p.toolCalls = append(p.toolCalls, toolCall)
+	}
+}
+
 // SSEToolCallHandler SSE工具调用处理器
 type SSEToolCallHandler struct {
-	ToolCalls []ToolCall
+	parser *StreamingJSONParser
+}
+
+// NewSSEToolCallHandler 创建新的SSE工具调用处理器
+func NewSSEToolCallHandler() *SSEToolCallHandler {
+	return &SSEToolCallHandler{
+		parser: NewStreamingJSONParser(),
+	}
 }
 
 // process 处理工具调用的增量内容
 func (h *SSEToolCallHandler) process(deltaContent string) ([]ToolCall, error) {
 	// 如果没有内容，直接返回当前的工具调用列表
 	if deltaContent == "" {
-		return h.ToolCalls, nil
+		return h.parser.toolCalls, nil
 	}
 
-	// 尝试解析工具调用
-	// 使用正则表达式匹配工具调用的各个部分
-	// 匹配工具调用的开始：{"index": <int>, "id": "<id>", "type": "function", "function": {"name": "<name>", "arguments": ""
-	toolCallStartRegex := regexp.MustCompile(`\{"index":\s*(\d+),\s*"id":\s*"([^"]+)",\s*"type":\s*"function",\s*"function":\s*\{"name":\s*"([^"]+)",\s*"arguments":\s*"([^"]*)`)
-
-	// 匹配参数的增量更新："arguments": "<chunk>"
-	argUpdateRegex := regexp.MustCompile(`"arguments":\s*"([^"]*)`)
-
-	// 查找所有可能的工具调用开始
-	startMatches := toolCallStartRegex.FindAllStringSubmatch(deltaContent, -1)
-
-	for _, match := range startMatches {
-		if len(match) < 5 {
-			continue
-		}
-
-		index, err := strconv.Atoi(match[1])
-		if err != nil {
-			continue
-		}
-
-		id := match[2]
-		name := match[3]
-		args := match[4]
-
-		// 检查是否已存在该索引的工具调用
-		found := false
-		for i, toolCall := range h.ToolCalls {
-			if toolCall.Index == index {
-				// 更新现有工具调用的参数
-				h.ToolCalls[i].Function.Arguments += args
-				found = true
-				break
-			}
-		}
-
-		// 如果不存在，则创建新的工具调用
-		if !found {
-			newToolCall := ToolCall{
-				Index: index,
-				ID:    id,
-				Type:  "function",
-				Function: ToolCallFunction{
-					Name:      name,
-					Arguments: args,
-				},
-			}
-			h.ToolCalls = append(h.ToolCalls, newToolCall)
-		}
+	// 使用流式JSON解析器处理内容
+	toolCalls, err := h.parser.ProcessChunk(deltaContent)
+	if err != nil {
+		debugLog("工具调用处理失败: %v", err)
+		return h.parser.toolCalls, err
 	}
 
-	// 处理参数更新（不包含工具调用开始的情况）
-	argMatches := argUpdateRegex.FindAllStringSubmatch(deltaContent, -1)
-	for _, match := range argMatches {
-		if len(match) < 2 {
-			continue
-		}
+	return toolCalls, nil
+}
 
-		args := match[1]
-		// 如果没有找到工具调用开始，但有参数更新，假设是更新最后一个工具调用
-		if len(h.ToolCalls) > 0 && len(startMatches) == 0 {
-			lastIndex := len(h.ToolCalls) - 1
-			h.ToolCalls[lastIndex].Function.Arguments += args
-		}
-	}
+// GetToolCalls 获取当前解析的工具调用列表
+func (h *SSEToolCallHandler) GetToolCalls() []ToolCall {
+	return h.parser.toolCalls
+}
 
-	return h.ToolCalls, nil
+// Reset 重置解析器状态
+func (h *SSEToolCallHandler) Reset() {
+	h.parser = NewStreamingJSONParser()
 }
 
 // ToolFunction 工具函数结构
@@ -996,7 +1132,7 @@ func addLiveRequest(method string, path string, status int, duration float64, us
 	}
 
 	request := LiveRequest{
-		ID:        fmt.Sprintf("%d%.3f", time.Now().Unix(), float64(time.Now().UnixNano()%1000000000)/1000000000.0),
+		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
 		Method:    method,
 		Path:      path,
@@ -1812,7 +1948,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	var sentInitialAnswer bool
 
 	// 创建工具调用处理器
-	toolCallHandler := &SSEToolCallHandler{}
+	toolCallHandler := NewSSEToolCallHandler()
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1939,7 +2075,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 
 		if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
 			// 检查是否有工具调用需要完成
-			if len(toolCallHandler.ToolCalls) > 0 {
+			if len(toolCallHandler.GetToolCalls()) > 0 {
 				// 发送工具调用完成信号
 				endChunk := OpenAIResponse{
 					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
@@ -1961,7 +2097,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 
 	// 根据是否有工具调用决定结束原因
 	finishReason := "stop"
-	if len(toolCallHandler.ToolCalls) > 0 {
+	if len(toolCallHandler.GetToolCalls()) > 0 {
 		finishReason = "tool_calls"
 	}
 
