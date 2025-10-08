@@ -17,6 +17,7 @@ from fake_useragent import UserAgent
 from app.core.config import settings
 from app.utils.helpers import debug_log
 from app.core.token_manager import token_manager
+from app.core.signature import generate_zs_signature
 
 # 全局 UserAgent 实例（单例模式）
 _user_agent_instance = None
@@ -79,7 +80,7 @@ def get_dynamic_headers(chat_id: str = "", user_agent: str = "") -> Dict[str, st
         "Accept-Language": "zh-CN",
         "Content-Type": "application/json",
         "User-Agent": user_agent,
-        "X-Fe-Version": "prod-fe-1.0.83",  # 匹配F12信息中的版本
+        "X-Fe-Version": "prod-fe-1.0.95",  # 使用参考文档中的版本
         "Origin": "https://chat.z.ai",
         "Connection": "keep-alive",
         "Sec-Fetch-Dest": "empty",
@@ -141,7 +142,8 @@ def build_query_params(
     request_id: str, 
     token: str,
     user_agent: str,
-    chat_id: str = ""
+    chat_id: str = "",
+    user_id: str = ""
 ) -> Dict[str, str]:
     """构建查询参数，模拟真实的浏览器请求
     
@@ -151,63 +153,33 @@ def build_query_params(
         token: 用户token
         user_agent: 用户代理字符串
         chat_id: 聊天ID
+        user_id: 用户ID（从JWT token中提取）
         
     Returns:
         查询参数字典
     """
-    # 生成用户ID（从token中提取或生成假的）
-    user_id = "guest-user-" + str(abs(hash(token)) % 1000000)
-    
-    # 编码用户代理
-    encoded_user_agent = urllib.parse.quote_plus(user_agent)
-    
-    # 当前时间相关
-    current_time = datetime.now()
-    local_time = current_time.isoformat() + "Z"
-    utc_time = current_time.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    # 如果没有提供user_id，尝试从token中提取
+    if not user_id:
+        try:
+            from app.core.signature import decode_jwt_payload
+            payload = decode_jwt_payload(token)
+            user_id = payload['id']
+        except Exception:
+            # 如果无法提取，使用假的user_id
+            user_id = "guest-user-" + str(abs(hash(token)) % 1000000)
     
     # 构建当前URL
     current_url = f"https://chat.z.ai/c/{chat_id}" if chat_id else "https://chat.z.ai/"
     pathname = f"/c/{chat_id}" if chat_id else "/"
     
+    # 使用参考文档中的基本参数格式
     query_params = {
         "timestamp": str(timestamp),
         "requestId": request_id,
-        "version": "0.0.1",
-        "platform": "web",
         "user_id": user_id,
         "token": token,
-        "user_agent": encoded_user_agent,
-        "language": "zh-CN",
-        "languages": "zh-CN,en,en-GB,en-US",
-        "timezone": "Asia/Shanghai",
-        "cookie_enabled": "true",
-        "screen_width": "1536",
-        "screen_height": "864",
-        "screen_resolution": "1536x864",
-        "viewport_height": "331",
-        "viewport_width": "1528",
-        "viewport_size": "1528x331",
-        "color_depth": "24",
-        "pixel_ratio": "1.25",
         "current_url": urllib.parse.quote_plus(current_url),
         "pathname": pathname,
-        "search": "",
-        "hash": "",
-        "host": "chat.z.ai",
-        "hostname": "chat.z.ai",
-        "protocol": "https:",
-        "referrer": "",
-        "title": "Chat with Z.ai - Free AI Chatbot powered by GLM-4.5",
-        "timezone_offset": "-480",
-        "local_time": local_time,
-        "utc_time": utc_time,
-        "is_mobile": "false",
-        "is_touch": "false",
-        "max_touch_points": "10",
-        "browser_name": "Chrome",
-        "os_name": "Windows",
-        # "signature_timestamp": str(timestamp),  # 已移除签名相关参数
     }
     
     return query_params
@@ -299,7 +271,7 @@ class ZAITransformer:
         转换OpenAI请求为z.ai格式
         整合现有功能：模型映射、MCP服务器等
         """
-        debug_log(f"🔄 开始转换 OpenAI 请求到 Z.AI 格式: {request.get('model', settings.PRIMARY_MODEL)} -> Z.AI")
+        debug_log(f"开始转换 OpenAI 请求到 Z.AI 格式: {request.get('model', settings.PRIMARY_MODEL)} -> Z.AI")
 
         # 获取认证令牌
         token = await self.get_token()
@@ -416,10 +388,14 @@ class ZAITransformer:
             "id": generate_uuid(),
         }
 
-        # 处理工具支持
-        if settings.TOOL_SUPPORT and not is_thinking and request.get("tools"):
+        # 处理工具支持 - 更简化的方式，直接传递tools和tool_servers
+        # 参考Go代码：直接设置tool_servers为空数组，让Z.AI自行处理工具
+        body["tool_servers"] = []  # Go代码中的ToolServers: []string{}
+        
+        if settings.TOOL_SUPPORT and request.get("tools"):
+            # 将OpenAI格式的tools转换为Z.AI格式
             body["tools"] = request["tools"]
-            debug_log(f"启用工具支持: {len(request['tools'])} 个工具")
+            debug_log(f"✅ 传递工具定义到Z.AI: {len(request['tools'])} 个工具")
         else:
             body["tools"] = None
 
@@ -431,12 +407,56 @@ class ZAITransformer:
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"
         dynamic_headers = get_dynamic_headers(chat_id, user_agent)
         
+        # 确保X-FE-Version与参考文档一致
+        dynamic_headers["X-FE-Version"] = "prod-fe-1.0.95"
+        
         # 构建查询参数
         query_params = build_query_params(timestamp, request_id, token, user_agent, chat_id)
         
-        # 签名已强制禁用 - 不生成任何签名
-        # request_body_str = json.dumps(body, ensure_ascii=False, separators=(',', ':'))
-        # signature = generate_signature(request_body_str, str(timestamp))
+        # 从token中提取user_id，确保签名和查询参数使用相同的user_id
+        user_id = ""
+        try:
+            from app.core.signature import decode_jwt_payload
+            payload = decode_jwt_payload(token)
+            user_id = payload['id']
+        except Exception as e:
+            debug_log(f"解码JWT token获取user_id失败: {e}")
+            user_id = "guest-user-" + str(abs(hash(token)) % 1000000)
+        
+        # 重新构建查询参数，传入真实的user_id
+        query_params = build_query_params(timestamp, request_id, token, user_agent, chat_id, user_id)
+        
+        # 生成Z.AI签名
+        try:
+            # 获取最近一次user content
+            user_content = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        user_content = content
+                    elif isinstance(content, list) and len(content) > 0:
+                        # 处理多模态内容，获取文本部分
+                        for part in content:
+                            if part.get("type") == "text":
+                                user_content = part.get("text", "")
+                                break
+                    break
+            
+            # 生成签名
+            signature_result = generate_zs_signature(token, request_id, timestamp, user_content)
+            signature = signature_result["signature"]
+            
+            # 添加签名到headers
+            dynamic_headers["X-Signature"] = signature
+            
+            # 添加签名时间戳到查询参数
+            query_params["signature_timestamp"] = str(timestamp)
+            
+            debug_log("  Z.AI签名已生成并添加到请求中")
+        except Exception as e:
+            debug_log(f"生成Z.AI签名失败: {e}")
+            # 签名失败不阻止请求继续
         
         # 构建完整的URL（包含查询参数）
         url_with_params = f"{self.api_url}?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
@@ -447,19 +467,16 @@ class ZAITransformer:
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         }
-        
-        # 签名功能已禁用
-        debug_log("  🔓 签名验证已禁用")
 
         config = {
             "url": url_with_params,
             "headers": headers,
         }
 
-        debug_log("✅ 请求转换完成")
+        debug_log("请求转换完成")
 
         # 记录关键的请求信息用于调试
-        debug_log(f"  📋 发送到Z.AI的关键信息:")
+        debug_log(f"  发送到Z.AI的关键信息:")
         debug_log(f"    - 上游模型: {body['model']}")
         debug_log(f"    - MCP服务器: {body['mcp_servers']}")
         debug_log(f"    - web_search: {body['features']['web_search']}")

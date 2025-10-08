@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -59,6 +61,13 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// hashString 计算字符串的哈希值，复刻 Python 的 hash() 行为
+func hashString(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
 }
 
 // loadConfig 加载并验证配置
@@ -1247,6 +1256,18 @@ func extractTextContent(content interface{}) string {
 		// 其他类型，尝试转换为字符串
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+// extractLastUserContent 从 UpstreamRequest 中提取最后一条用户消息的内容
+func extractLastUserContent(req UpstreamRequest) string {
+	// 从后往前遍历消息，找到最后一条 role 为 "user" 的消息
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			return req.Messages[i].Content
+		}
+	}
+	// 如果没有找到用户消息，返回空字符串
+	return ""
 }
 
 // processMultimodalContent 处理全方位多模态内容，支持图像、视频、文档、音频等
@@ -2948,7 +2969,66 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	debugLog("调用上游API: %s (超时: %v)", appConfig.UpstreamUrl, timeout)
 	debugLog("上游请求体: %s", maskJSONForLogging(buf.String()))
 
-	req, err := http.NewRequestWithContext(ctx, "POST", appConfig.UpstreamUrl, bytes.NewReader(buf.Bytes()))
+	// 生成签名所需的参数
+	requestID := uuid.New().String()
+	timestamp := time.Now().UnixMilli()
+	userContent := extractLastUserContent(upstreamReq)
+
+	// 从 authToken 中解析 user_id
+	var userID string
+	if jwtPayload, err := decodeJWT(authToken); err == nil {
+		userID = jwtPayload.ID
+		debugLog("从 JWT token 中成功解析 user_id: %s", userID)
+	} else {
+		// Fallback logic matching Python's abs(hash(token)) % 1000000
+		hashVal := hashString(authToken)
+		userID = fmt.Sprintf("guest-user-%d", hashVal%1000000)
+		debugLog("解析 JWT token 失败: %v, 使用回退 user_id: %s", err, userID)
+	}
+
+	// 生成签名
+	signature, err := generateZsSignature(userID, requestID, timestamp, userContent)
+	if err != nil {
+		debugLog("生成签名失败: %v", err)
+		cancel() // 手动取消上下文
+		return nil, nil, err
+	}
+
+	// 构建 current_url 和 pathname
+	var currentURL, pathname string
+	if refererChatID != "" {
+		currentURL = fmt.Sprintf("https://chat.z.ai/c/%s", refererChatID)
+		pathname = fmt.Sprintf("/c/%s", refererChatID)
+	} else {
+		currentURL = "https://chat.z.ai/"
+		pathname = "/"
+	}
+
+	// 使用 net/url 包构建完整的查询参数
+	parsedURL, err := url.Parse(appConfig.UpstreamUrl)
+	if err != nil {
+		debugLog("解析上游URL失败: %v", err)
+		cancel() // 手动取消上下文
+		return nil, nil, err
+	}
+
+	// 构建查询参数
+	query := parsedURL.Query()
+	query.Set("signature_timestamp", fmt.Sprintf("%d", timestamp))
+	query.Set("requestId", requestID)
+	query.Set("timestamp", fmt.Sprintf("%d", timestamp)) // 与 signature_timestamp 值相同
+	query.Set("user_id", userID)
+	query.Set("token", authToken)
+	query.Set("current_url", currentURL) // net/url 会自动进行 URL 编码
+	query.Set("pathname", pathname)
+
+	parsedURL.RawQuery = query.Encode()
+	upstreamURL := parsedURL.String()
+
+	debugLog("构建的完整URL: %s", upstreamURL)
+	debugLog("查询参数: user_id=%s, current_url=%s, pathname=%s", userID, currentURL, pathname)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(buf.Bytes()))
 	if err != nil {
 		debugLog("创建HTTP请求失败: %v", err)
 		cancel() // 手动取消上下文
@@ -2960,6 +3040,9 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
+
+	// 注入签名头
+	req.Header.Set("X-Signature", signature.Signature)
 
 	// Add additional headers for SSE compatibility
 	req.Header.Set("Content-Type", "application/json")

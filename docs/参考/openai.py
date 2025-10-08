@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.models.schemas import OpenAIRequest, Message, ModelsResponse, Model
 from app.utils.helpers import debug_log
 from app.core.zai_transformer import ZAITransformer, generate_uuid
-from app.utils.sse_tool_handler import SSEToolHandler
+# from app.utils.sse_tool_handler import SSEToolHandler  # 已移除工具处理器的使用
 
 router = APIRouter()
 
@@ -206,23 +206,17 @@ async def chat_completions(request: OpenAIRequest, authorization: str = Header(.
                             if current_token:
                                 transformer.mark_token_success(current_token)
 
-                            # 初始化工具处理器（如果需要）
+                            # 不再使用复杂的工具处理器，直接转发Z.AI的响应
                             has_tools = transformed["body"].get("tools") is not None
                             has_mcp_servers = bool(transformed["body"].get("mcp_servers"))
-                            tool_handler = None
-
-                            # 如果有工具定义或MCP服务器，都需要工具处理器
+                            
                             if has_tools or has_mcp_servers:
-                                chat_id = transformed["body"]["chat_id"]
-                                model = request.model
-                                tool_handler = SSEToolHandler(chat_id, model)
-
                                 if has_tools and has_mcp_servers:
-                                    debug_log(f"🔧 初始化工具处理器: {len(transformed['body'].get('tools', []))} 个OpenAI工具 + {len(transformed['body'].get('mcp_servers', []))} 个MCP服务器")
+                                    debug_log(f"🔧 检测到: {len(transformed['body'].get('tools', []))} 个OpenAI工具 + {len(transformed['body'].get('mcp_servers', []))} 个MCP服务器")
                                 elif has_tools:
-                                    debug_log(f"🔧 初始化工具处理器: {len(transformed['body'].get('tools', []))} 个OpenAI工具")
+                                    debug_log(f"🔧 检测到: {len(transformed['body'].get('tools', []))} 个OpenAI工具")
                                 elif has_mcp_servers:
-                                    debug_log(f"🔧 初始化工具处理器: {len(transformed['body'].get('mcp_servers', []))} 个MCP服务器")
+                                    debug_log(f"🔧 检测到: {len(transformed['body'].get('mcp_servers', []))} 个MCP服务器")
 
                             # 处理状态
                             has_thinking = False
@@ -298,18 +292,8 @@ async def chat_completions(request: OpenAIRequest, authorization: str = Header(.
                                                         debug_log(f"📈 SSE 阶段: {phase}")
                                                         stream_response._last_phase = phase
 
-                                                    # 处理工具调用
-                                                    if phase == "tool_call" and tool_handler:
-                                                        for output in tool_handler.process_tool_call_phase(data, True):
-                                                            yield output
-
-                                                    # 处理其他阶段（工具结束）
-                                                    elif phase == "other" and tool_handler:
-                                                        for output in tool_handler.process_other_phase(data, True):
-                                                            yield output
-
                                                     # 处理思考内容
-                                                    elif phase == "thinking":
+                                                    if phase == "thinking":
                                                         if not has_thinking:
                                                             has_thinking = True
                                                             # 发送初始角色
@@ -491,29 +475,28 @@ async def chat_completions(request: OpenAIRequest, authorization: str = Header(.
                                                     if data.get("usage"):
                                                         debug_log(f"📦 完成响应 - 使用统计: {json.dumps(data['usage'])}")
 
-                                                        # 只有在非工具调用模式下才发送普通完成信号
-                                                        if not tool_handler or not tool_handler.has_tool_call:
-                                                            finish_chunk = {
-                                                                "choices": [
-                                                                    {
-                                                                        "delta": {},  # 空的delta表示结束
-                                                                        "finish_reason": "stop",
-                                                                        "index": 0,
-                                                                        "logprobs": None,
-                                                                    }
-                                                                ],
-                                                                "usage": data["usage"],
-                                                                "created": int(time.time()),
-                                                                "id": transformed["body"]["chat_id"],
-                                                                "model": request.model,
-                                                                "object": "chat.completion.chunk",
-                                                                "system_fingerprint": "fp_zai_001",
-                                                            }
-                                                            finish_output = f"data: {json.dumps(finish_chunk)}\n\n"
-                                                            debug_log("➡️ 发送完成信号")
-                                                            yield finish_output
-                                                            debug_log("➡️ 发送 [DONE]")
-                                                            yield "data: [DONE]\n\n"
+                                                        # 发送完成信号
+                                                        finish_chunk = {
+                                                            "choices": [
+                                                                {
+                                                                    "delta": {},  # 空的delta表示结束
+                                                                    "finish_reason": "stop",
+                                                                    "index": 0,
+                                                                    "logprobs": None,
+                                                                }
+                                                            ],
+                                                            "usage": data["usage"],
+                                                            "created": int(time.time()),
+                                                            "id": transformed["body"]["chat_id"],
+                                                            "model": request.model,
+                                                            "object": "chat.completion.chunk",
+                                                            "system_fingerprint": "fp_zai_001",
+                                                        }
+                                                        finish_output = f"data: {json.dumps(finish_chunk)}\n\n"
+                                                        debug_log("➡️ 发送完成信号")
+                                                        yield finish_output
+                                                        debug_log("➡️ 发送 [DONE]")
+                                                        yield "data: [DONE]\n\n"
 
                                             except json.JSONDecodeError as e:
                                                 debug_log(f"❌ JSON解析错误: {e}, 内容: {chunk_str[:200]}")
@@ -539,52 +522,23 @@ async def chat_completions(request: OpenAIRequest, authorization: str = Header(.
                                     break
 
                             # 确保发送结束信号
-                            if not tool_handler or not tool_handler.has_tool_call:
-                                debug_log("📤 发送最终 [DONE] 信号")
-                                yield "data: [DONE]\n\n"
+                            debug_log("📤 发送最终 [DONE] 信号")
+                            yield "data: [DONE]\n\n"
 
                             debug_log(f"✅ SSE 流处理完成，共处理 {line_count} 行数据，{chunk_count} 个数据块")
                             
-                            # 检查处理完整性
-                            is_complete = True
-                            completion_issues = []
-                            
+                            # 简化的完整性检查
                             if line_count == 0:
-                                is_complete = False
-                                completion_issues.append("没有处理任何数据行")
-                            elif chunk_count == 0:
-                                is_complete = False
-                                completion_issues.append("没有收到任何数据块")
+                                debug_log("⚠️ 没有处理任何数据行")
+                                if retry_count < settings.MAX_RETRIES:
+                                    debug_log("🔄 准备重试")
+                                    retry_count += 1
+                                    last_error = "No data received"
+                                    continue
                             elif chunk_count > 0:
                                 debug_log(f"📊 平均每个数据块包含 {line_count/chunk_count:.1f} 行")
                             
-                            # 检查工具调用完整性
-                            if tool_handler and tool_handler.has_tool_call:
-                                if not tool_handler.completed_tools:
-                                    completion_issues.append("工具调用未正常完成")
-                                else:
-                                    debug_log(f"✅ 工具调用完成: {len(tool_handler.completed_tools)} 个工具")
-                            
-                            # 检查思考内容完整性（只有真正的thinking模式才需要签名）
-                            # 注意：普通的answer阶段不需要thinking签名，只有thinking阶段才需要
-                            # if has_thinking and not thinking_signature:
-                            #     completion_issues.append("思考内容缺少签名")
-                            
-                            # 报告完整性状态
-                            if is_complete and not completion_issues:
-                                debug_log("✅ 响应完整性检查通过")
-                            else:
-                                debug_log(f"⚠️ 响应完整性问题: {', '.join(completion_issues)}")
-                                
-                                # 如果问题严重且还有重试机会，考虑重试
-                                critical_issues = ["没有处理任何数据行", "没有收到任何数据块"]
-                                has_critical_issue = any(issue in completion_issues for issue in critical_issues)
-                                
-                                if has_critical_issue and retry_count < settings.MAX_RETRIES:
-                                    debug_log("🔄 检测到严重完整性问题，准备重试")
-                                    retry_count += 1
-                                    last_error = f"Incomplete response: {', '.join(completion_issues)}"
-                                    continue
+                            debug_log("✅ 响应完整性检查通过")
                             
                             # 成功处理完成，退出重试循环
                             return
