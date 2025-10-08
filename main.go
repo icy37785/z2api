@@ -33,6 +33,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 )
 
 // Config 配置结构体
@@ -49,13 +50,10 @@ type Config struct {
 
 // TokenCache Token缓存结构体
 type TokenCache struct {
-	token       string
-	expiresAt   time.Time
-	mutex       sync.RWMutex
-	fetching    bool      // 标记是否正在获取token
-	fetchErr    error     // 记录最后一次获取错误
-	fetchTime   time.Time // 记录获取时间，用于超时控制
-	invalidated bool      // 标记token是否已失效，需要强制刷新
+	token     string
+	expiresAt time.Time
+	mutex     sync.RWMutex
+	sf        singleflight.Group
 }
 
 // getEnv 获取环境变量值，如果不存在则返回默认值
@@ -313,22 +311,6 @@ var (
 	// 这可以防止在高并发时消耗过多资源
 	// 注意：会在main函数中根据配置重新创建
 	concurrencyLimiter *semaphore.Weighted
-
-	// sonic 编码器和解码器对象池
-	sonicEncoderPool = sync.Pool{
-		New: func() interface{} {
-			// 创建一个 bytes.Buffer 作为编码器的目标
-			buf := &bytes.Buffer{}
-			return sonic.ConfigStd.NewEncoder(buf)
-		},
-	}
-
-	sonicDecoderPool = sync.Pool{
-		New: func() interface{} {
-			// 创建一个空的字符串作为解码器的源
-			return sonic.ConfigStd.NewDecoder(strings.NewReader(""))
-		},
-	}
 )
 
 // gzipReadCloser 包装gzip.Reader和原始的io.ReadCloser
@@ -377,527 +359,6 @@ type ToolCall struct {
 	ID       string           `json:"id,omitempty"`
 	Type     string           `json:"type,omitempty"`
 	Function ToolCallFunction `json:"function,omitempty"`
-}
-
-// SSEToolCallHandler SSE工具调用处理器
-type SSEToolCallHandler struct {
-	buffer         []byte
-	toolCalls      []ToolCall
-	expansionCount int // 跟踪缓冲区扩展次数
-	maxExpansions  int // 最大允许扩展次数
-	maxBufferSize  int // 最大缓冲区大小
-}
-
-// NewSSEToolCallHandler 创建新的SSE工具调用处理器
-func NewSSEToolCallHandler() *SSEToolCallHandler {
-	return &SSEToolCallHandler{
-		buffer:         make([]byte, 0, 4096), // 预分配4KB
-		toolCalls:      make([]ToolCall, 0),
-		expansionCount: 0,
-		maxExpansions:  500,                      // 减少最大扩展次数
-		maxBufferSize:  int(MaxResponseSize / 2), // 限制单个handler最大缓冲区为响应大小的一半
-	}
-}
-
-// isArgumentsComplete checks if a JSON string appears to be complete.
-// 参考Python实现，增强JSON完整性检查机制
-func (h *SSEToolCallHandler) isArgumentsComplete(args string) bool {
-	trimmedArgs := strings.TrimSpace(args)
-	if trimmedArgs == "" {
-		return false
-	}
-
-	// 检查是否以有效的JSON结束符号结尾
-	if !strings.HasSuffix(trimmedArgs, "}") && !strings.HasSuffix(trimmedArgs, "\"") {
-		debugLog("参数不完整: 没有正确的结束符号")
-		return false
-	}
-
-	// 尝试解析JSON来验证其完整性
-	var temp interface{}
-	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
-	err := sonic.Unmarshal([]byte(trimmedArgs), &temp)
-	if err != nil {
-		debugLog("参数JSON解析失败，判定为不完整: %v", err)
-		return false
-	}
-
-	return true
-}
-
-// isBasicStructureValid 检查基本的JSON结构是否有效
-func (h *SSEToolCallHandler) isBasicStructureValid(args string) bool {
-	// 检查是否至少有基本的JSON结构
-	if !strings.HasPrefix(strings.TrimSpace(args), "{") {
-		return false
-	}
-	if !strings.HasSuffix(strings.TrimSpace(args), "}") {
-		return false
-	}
-
-	// 检查引号是否平衡
-	quoteCount := 0
-	escaped := false
-	for _, r := range args {
-		if escaped {
-			escaped = false
-			continue
-		}
-		if r == '\\' {
-			escaped = true
-			continue
-		}
-		if r == '"' {
-			quoteCount++
-		}
-	}
-
-	// 引号应该是偶数个
-	return quoteCount%2 == 0
-}
-
-// isIncompleteURL 检查URL是否不完整
-func (h *SSEToolCallHandler) isIncompleteURL(url string) bool {
-	// 常见的不完整URL模式
-	incompletePatterns := []string{
-		".go", ".goo", ".goog", // Google相关的不完整域名
-		".co", ".net", ".or", ".ed", // 常见TLD的不完整形式
-		"://", "http", "https", // 协议不完整
-	}
-
-	for _, pattern := range incompletePatterns {
-		if strings.HasSuffix(url, pattern) {
-			return true
-		}
-	}
-
-	// 检查是否以域名分隔符结尾但没有完整TLD
-	if strings.HasSuffix(url, ".com/") || strings.HasSuffix(url, ".net/") {
-		return false // 这些是完整的
-	}
-
-	if strings.HasSuffix(url, ".") && !strings.HasSuffix(url, "./") {
-		return true // 以点结尾但不是相对路径
-	}
-
-	return false
-}
-
-// isTruncatedValue 检查值是否可能被截断
-func (h *SSEToolCallHandler) isTruncatedValue(value string) bool {
-	if len(value) == 0 {
-		return false
-	}
-
-	lastChar := value[len(value)-1]
-
-	// 检查明显的截断标记
-	truncationChars := []rune{'/', ':', '=', '&', '?', ','}
-	for _, char := range truncationChars {
-		if rune(lastChar) == char {
-			return true
-		}
-	}
-
-	// 特殊处理点号：如果不是句子结尾，可能是截断
-	if lastChar == '.' && len(value) > 1 {
-		// 如果前一个字符不是空格，可能是截断（如域名、扩展名等）
-		prevChar := value[len(value)-2]
-		if prevChar != ' ' && prevChar != '\n' && prevChar != '\t' {
-			// 进一步检查：如果看起来像文件扩展名或域名，可能是截断
-			if strings.Contains(value, "http") || strings.Contains(value, "www") ||
-				strings.Contains(value, ".com") || strings.Contains(value, ".js") {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// fixIncompleteJSON 修复不完整的JSON字符串，参考Python实现
-func (h *SSEToolCallHandler) fixIncompleteJSON(jsonStr string) string {
-	if jsonStr == "" {
-		return "{}"
-	}
-
-	// Remove leading/trailing whitespace
-	jsonStr = strings.TrimSpace(jsonStr)
-
-	// Handle special cases
-	if strings.ToLower(jsonStr) == "null" || jsonStr == "\"null\"" {
-		return "{}"
-	}
-
-	// Handle escaped JSON strings
-	if strings.HasPrefix(jsonStr, "{\\\"") && strings.HasSuffix(jsonStr, "\\\"}") {
-		// This is an escaped JSON string, need to unescape
-		jsonStr = strings.ReplaceAll(jsonStr, "\\\"", "\"")
-	} else if strings.HasPrefix(jsonStr, "\"{\\\"") && strings.HasSuffix(jsonStr, "\\\"}\"") {
-		// Double-escaped case
-		jsonStr = jsonStr[1 : len(jsonStr)-1] // Remove outer quotes
-		jsonStr = strings.ReplaceAll(jsonStr, "\\\"", "\"")
-	} else if strings.HasPrefix(jsonStr, "\"") && strings.HasSuffix(jsonStr, "\"") {
-		// Simple quote wrapping, remove outer quotes
-		jsonStr = jsonStr[1 : len(jsonStr)-1]
-	}
-
-	// Ensure starts with {
-	if !strings.HasPrefix(jsonStr, "{") {
-		jsonStr = "{" + jsonStr
-	}
-
-	// Handle incomplete string values - fix unmatched quotes
-	quoteCount := strings.Count(jsonStr, "\"") - strings.Count(jsonStr, "\\\"")
-	if quoteCount%2 != 0 {
-		// Odd number of quotes, may have unclosed string
-		jsonStr += "\""
-	}
-
-	// Ensure ends with }
-	if !strings.HasSuffix(jsonStr, "}") {
-		jsonStr += "}"
-	}
-
-	return jsonStr
-}
-
-// cleanArgumentsString 清理和标准化参数字符串，参考Python实现
-func (h *SSEToolCallHandler) cleanArgumentsString(argumentsRaw string) string {
-	if argumentsRaw == "" {
-		return "{}"
-	}
-
-	// Remove leading/trailing whitespace
-	cleaned := strings.TrimSpace(argumentsRaw)
-
-	// Handle special values
-	if strings.ToLower(cleaned) == "null" {
-		return "{}"
-	}
-
-	// Handle escaped JSON strings
-	if strings.HasPrefix(cleaned, "{\\\"") && strings.HasSuffix(cleaned, "\\\"}") {
-		// This is an escaped JSON string, need to unescape
-		cleaned = strings.ReplaceAll(cleaned, "\\\"", "\"")
-	} else if strings.HasPrefix(cleaned, "\"{\\\"") && strings.HasSuffix(cleaned, "\\\"}\"") {
-		// Double-escaped case
-		cleaned = cleaned[1 : len(cleaned)-1] // Remove outer quotes
-		cleaned = strings.ReplaceAll(cleaned, "\\\"", "\"")
-	} else if strings.HasPrefix(cleaned, "\"") && strings.HasSuffix(cleaned, "\"") {
-		// Simple quote wrapping, remove outer quotes
-		cleaned = cleaned[1 : len(cleaned)-1]
-	}
-
-	// Fix incomplete JSON
-	cleaned = h.fixIncompleteJSON(cleaned)
-
-	// Try to parse and re-serialize for normalization
-	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
-	var parsed interface{}
-	if err := sonic.Unmarshal([]byte(cleaned), &parsed); err == nil {
-		if parsed == nil {
-			return "{}"
-		}
-		if normalized, err := sonic.Marshal(parsed); err == nil {
-			return string(normalized)
-		}
-	} else {
-		debugLog("JSON标准化失败，保持原样: %s...", cleaned[:min(50, len(cleaned))])
-	}
-
-	return cleaned
-}
-
-// extractKeyValuePairs 从文本中提取键值对，作为最后的解析尝试
-func (h *SSEToolCallHandler) extractKeyValuePairs(text string) map[string]interface{} {
-	result := make(map[string]interface{})
-
-	// Match "key": "value" or "key": value patterns
-	matches := stringPattern.FindAllStringSubmatch(text, -1)
-	for _, match := range matches {
-		if len(match) >= 3 {
-			result[match[1]] = match[2]
-		}
-	}
-
-	// Match number values
-	matches = numberPattern.FindAllStringSubmatch(text, -1)
-	for _, match := range matches {
-		if len(match) >= 3 {
-			if num, err := strconv.Atoi(match[2]); err == nil {
-				result[match[1]] = num
-			} else {
-				result[match[1]] = match[2]
-			}
-		}
-	}
-
-	// Match boolean values
-	matches = boolPattern.FindAllStringSubmatch(text, -1)
-	for _, match := range matches {
-		if len(match) >= 3 {
-			result[match[1]] = match[2] == "true"
-		}
-	}
-
-	return result
-}
-
-// parsePartialArguments 解析不完整的参数字符串，尽可能提取有效信息
-func (h *SSEToolCallHandler) parsePartialArguments(argumentsRaw string) map[string]interface{} {
-	if argumentsRaw == "" || strings.TrimSpace(argumentsRaw) == "" || strings.ToLower(strings.TrimSpace(argumentsRaw)) == "null" {
-		return make(map[string]interface{})
-	}
-
-	// Try cleaning first
-	cleaned := h.cleanArgumentsString(argumentsRaw)
-	var result map[string]interface{}
-	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
-	if err := sonic.Unmarshal([]byte(cleaned), &result); err == nil {
-		if result == nil {
-			return make(map[string]interface{})
-		}
-		return result
-	}
-
-	// Try fixing common JSON issues
-	fixed := strings.TrimSpace(argumentsRaw)
-
-	// Handle escape characters
-	if strings.Contains(fixed, "\\") {
-		fixed = strings.ReplaceAll(fixed, "\\\"", "\"")
-	}
-
-	// If doesn't start with {, add it
-	if !strings.HasPrefix(fixed, "{") {
-		fixed = "{" + fixed
-	}
-
-	// If doesn't end with }, try adding it
-	if !strings.HasSuffix(fixed, "}") {
-		// Count unmatched quotes and brackets
-		quoteCount := strings.Count(fixed, "\"") - strings.Count(fixed, "\\\"")
-		if quoteCount%2 != 0 {
-			fixed += "\""
-		}
-		fixed += "}"
-	}
-
-	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
-	if err := sonic.Unmarshal([]byte(fixed), &result); err == nil {
-		return result
-	}
-
-	// Last resort: extract key-value pairs
-	return h.extractKeyValuePairs(argumentsRaw)
-}
-
-// min helper function
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// shouldSendArgumentUpdate decides if a tool call update is significant enough to be sent.
-func (h *SSEToolCallHandler) shouldSendArgumentUpdate(oldArgs, newArgs string) bool {
-	if newArgs == oldArgs {
-		return false
-	}
-	// If the new arguments are complete, send the update.
-	if h.isArgumentsComplete(newArgs) {
-		return true
-	}
-	// If the new arguments are a significant improvement (e.g., much longer), send the update.
-	if len(newArgs) > len(oldArgs)+10 { // Arbitrary threshold for "significant"
-		return true
-	}
-	return false
-}
-
-// process handles incremental content for tool calls and returns updates to be sent.
-func (h *SSEToolCallHandler) process(editIndex int, editContent string) ([]ToolCall, error) {
-	if editContent == "" {
-		return nil, nil // Return nil for no updates
-	}
-
-	h.applyEditToBuffer(editIndex, editContent)
-	return h.processToolCallsFromBuffer()
-}
-
-// applyEditToBuffer updates the content buffer at a specific position.
-// 改进缓冲区管理：增强输入验证和更安全的內存控制
-// applyEditToBuffer updates the content buffer at a specific position.
-// 仿照Python参考实现，使用空字节填充和覆盖的策略。
-func (h *SSEToolCallHandler) applyEditToBuffer(editIndex int, editContent string) {
-	editBytes := []byte(editContent)
-	requiredLength := editIndex + len(editBytes)
-
-	// 检查是否超出最大缓冲区限制
-	if requiredLength > h.maxBufferSize {
-		debugLog("工具调用缓冲区将超出最大限制: required=%d, max=%d", requiredLength, h.maxBufferSize)
-		// 计算可容纳的最大内容长度
-		maxContentLength := h.maxBufferSize - editIndex
-		if maxContentLength <= 0 {
-			debugLog("缓冲区已满，无法添加更多内容")
-			return
-		}
-		// 截断内容以适应缓冲区限制
-		editBytes = editBytes[:maxContentLength]
-		requiredLength = editIndex + len(editBytes)
-		debugLog("截断内容以适应缓冲区: 截断后长度=%d", len(editBytes))
-	}
-
-	// 如果editIndex超出了当前缓冲区的长度，用空字节填充
-	if len(h.buffer) < editIndex {
-		padding := make([]byte, editIndex-len(h.buffer))
-		h.buffer = append(h.buffer, padding...)
-	}
-
-	// 确保缓冲区足够长以容纳新内容
-	if len(h.buffer) < requiredLength {
-		h.buffer = append(h.buffer, make([]byte, requiredLength-len(h.buffer))...)
-	}
-
-	// 在指定位置覆盖内容
-	copy(h.buffer[editIndex:], editBytes)
-}
-
-// processToolCallsFromBuffer parses tool calls from the buffer and returns updates to be sent.
-// 优化性能：减少字符串/字节数组转换
-func (h *SSEToolCallHandler) processToolCallsFromBuffer() ([]ToolCall, error) {
-	// 避免每次都创建新的string，优化性能
-	if len(h.buffer) == 0 {
-		return nil, nil
-	}
-
-	// 使用更高效的字节操作，避免不必要的内存分配
-	cleanBuffer := make([]byte, 0, len(h.buffer))
-	for _, b := range h.buffer {
-		if b != 0 {
-			cleanBuffer = append(cleanBuffer, b)
-		}
-	}
-
-	contentStr := string(cleanBuffer)
-	matches := glmBlockRegex.FindAllStringSubmatch(contentStr, -1)
-
-	var updates []ToolCall
-	for _, match := range matches {
-		if len(match) > 1 {
-			blockContent := match[1]
-			if updatedTool, shouldSend := h.processSingleToolBlock(blockContent); shouldSend {
-				updates = append(updates, updatedTool)
-			}
-		}
-	}
-	return updates, nil
-}
-
-// processSingleToolBlock handles a single tool block and decides if an update should be sent.
-func (h *SSEToolCallHandler) processSingleToolBlock(blockContent string) (ToolCall, bool) {
-	var toolData struct {
-		Data struct {
-			Metadata struct {
-				ID        string `json:"id"`
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
-			} `json:"metadata"`
-		} `json:"data"`
-	}
-
-	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
-	if err := sonic.Unmarshal([]byte(blockContent), &toolData); err == nil {
-		metadata := toolData.Data.Metadata
-		if metadata.ID != "" && metadata.Name != "" {
-			return h.handleToolUpdate(metadata.ID, metadata.Name, metadata.Arguments)
-		}
-	} else {
-		return h.extractToolDataFromPartialJSON(blockContent)
-	}
-	return ToolCall{}, false
-}
-
-// extractToolDataFromPartialJSON extracts tool information from partial JSON data.
-// 使用增强的JSON解析方法
-func (h *SSEToolCallHandler) extractToolDataFromPartialJSON(blockContent string) (ToolCall, bool) {
-
-	var id, name, args string
-	if idMatches := idRegex.FindStringSubmatch(blockContent); len(idMatches) > 1 {
-		id = idMatches[1]
-	}
-	if nameMatches := nameRegex.FindStringSubmatch(blockContent); len(nameMatches) > 1 {
-		name = nameMatches[1]
-	}
-	if argsMatches := argsRegex.FindStringSubmatch(blockContent); len(argsMatches) > 1 {
-		// 使用增强的参数解析
-		args = h.cleanArgumentsString(argsMatches[1])
-	}
-
-	if id != "" && name != "" {
-		return h.handleToolUpdate(id, name, args)
-	}
-	return ToolCall{}, false
-}
-
-// handleToolUpdate handles the creation or update of a tool call and decides if an update should be sent.
-func (h *SSEToolCallHandler) handleToolUpdate(toolID, toolName, argumentsRaw string) (ToolCall, bool) {
-	// Find if the tool call already exists.
-	for i, tc := range h.toolCalls {
-		if tc.ID == toolID {
-			if h.shouldSendArgumentUpdate(tc.Function.Arguments, argumentsRaw) {
-				h.toolCalls[i].Function.Arguments = argumentsRaw
-				return h.toolCalls[i], true
-			}
-			return h.toolCalls[i], false // Return existing tool, but don't send
-		}
-	}
-
-	// If it doesn't exist, add a new tool call.
-	newToolCall := ToolCall{
-		Index: len(h.toolCalls),
-		ID:    toolID,
-		Type:  "function",
-		Function: ToolCallFunction{
-			Name:      toolName,
-			Arguments: argumentsRaw,
-		},
-	}
-	h.toolCalls = append(h.toolCalls, newToolCall)
-	return newToolCall, true
-}
-
-// GetToolCalls 获取当前解析的工具调用列表
-func (h *SSEToolCallHandler) GetToolCalls() []ToolCall {
-	return h.toolCalls
-}
-
-// Reset 重置解析器状态，优化内存使用
-func (h *SSEToolCallHandler) Reset() {
-	// 优化内存管理：根据使用情况动态调整缓冲区大小
-	currentCap := cap(h.buffer)
-
-	// 如果缓冲区过大，重新分配较小的缓冲区
-	if currentCap > 16384 { // 如果容量超过16KB
-		h.buffer = make([]byte, 0, 4096) // 重新分配4KB
-		debugLog("重置工具调用处理器: 重新分配缓冲区，从%d字节减少到4096字节", currentCap)
-	} else if currentCap > 8192 { // 如果容量超过8KB
-		h.buffer = make([]byte, 0, 4096) // 重新分配4KB
-		debugLog("重置工具调用处理器: 重新分配缓冲区，从%d字节减少到4096字节", currentCap)
-	} else {
-		h.buffer = h.buffer[:0] // 重用现有缓冲区但清空内容
-	}
-
-	// 重用toolCalls切片，避免重新分配
-	if cap(h.toolCalls) > 16 { // 如果容量过大
-		h.toolCalls = make([]ToolCall, 0, 4) // 重新分配较小容量
-	} else {
-		h.toolCalls = h.toolCalls[:0] // 重用现有切片
-	}
-
-	h.expansionCount = 0
 }
 
 // ToolFunction 工具函数结构
@@ -1124,19 +585,6 @@ func extractTextContent(content interface{}) string {
 	case string:
 		// 简单文本内容
 		return v
-	case []interface{}:
-		// 多模态内容数组 - 旧格式兼容
-		var textParts []string
-		for _, part := range v {
-			if partMap, ok := part.(map[string]interface{}); ok {
-				if partType, hasType := partMap["type"].(string); hasType && partType == "text" {
-					if text, hasText := partMap["text"].(string); hasText {
-						textParts = append(textParts, text)
-					}
-				}
-			}
-		}
-		return strings.Join(textParts, " ")
 	case []ContentPart:
 		// 新格式的多模态内容数组
 		var textParts []string
@@ -1255,23 +703,6 @@ func normalizeMultimodalMessage(msg Message, model string) UpstreamMessage {
 		return UpstreamMessage{
 			Role:             normalizeRole(msg.Role),
 			Content:          textContent,
-			ReasoningContent: msg.ReasoningContent,
-		}
-	} else if contentSlice, ok := msg.Content.([]interface{}); ok {
-		// 兼容旧格式的多模态内容
-		var textParts []string
-		for _, part := range contentSlice {
-			if partMap, ok := part.(map[string]interface{}); ok {
-				if partType, hasType := partMap["type"].(string); hasType && partType == "text" {
-					if text, hasText := partMap["text"].(string); hasText {
-						textParts = append(textParts, text)
-					}
-				}
-			}
-		}
-		return UpstreamMessage{
-			Role:             normalizeRole(msg.Role),
-			Content:          strings.Join(textParts, " "),
 			ReasoningContent: msg.ReasoningContent,
 		}
 	} else {
@@ -1819,54 +1250,6 @@ func (sm *StatsManager) GetStats() *RequestStats {
 	return statsCopy
 }
 
-// getTopModels 获取热门模型（保持向后兼容）
-func getTopModels() []struct {
-	Model string `json:"model"`
-	Count int64  `json:"count"`
-} {
-	// 检查 stats 是否已初始化，防止在测试环境中出现空指针错误
-	if stats == nil {
-		// 返回空结果而不是崩溃
-		return []struct {
-			Model string `json:"model"`
-			Count int64  `json:"count"`
-		}{}
-	}
-
-	stats.mutex.RLock()
-	defer stats.mutex.RUnlock()
-
-	// Convert map to slice and sort
-	type modelCount struct {
-		model string
-		count int64
-	}
-	pairs := make([]modelCount, 0, len(stats.ModelUsage))
-	for model, count := range stats.ModelUsage {
-		pairs = append(pairs, modelCount{model, count})
-	}
-
-	// Sort by count (descending) using a more efficient algorithm
-	sort.Slice(pairs, func(i, j int) bool {
-		return pairs[i].count > pairs[j].count
-	})
-
-	// Take top 3
-	maxLen := min(3, len(pairs))
-	result := make([]struct {
-		Model string `json:"model"`
-		Count int64  `json:"count"`
-	}, maxLen)
-	for i := 0; i < maxLen; i++ {
-		result[i] = struct {
-			Model string `json:"model"`
-			Count int64  `json:"count"`
-		}{Model: pairs[i].model, Count: pairs[i].count}
-	}
-
-	return result
-}
-
 // getClientIP 获取客户端IP
 func getClientIP(r *http.Request) string {
 	xForwardedFor := r.Header.Get("X-Forwarded-For")
@@ -2111,142 +1494,61 @@ func (eh *ErrorHandler) RecoverFromPanic(w http.ResponseWriter, r *http.Request)
 var globalErrorHandler *ErrorHandler
 
 // 获取匿名token（每次对话使用不同token，避免共享记忆）
-// GetToken 从缓存或新获取Token，改进等待逻辑和错误处理
+// GetToken 从缓存或新获取Token，使用 singleflight 防止缓存击穿
 func (tc *TokenCache) GetToken() (string, error) {
 	// 先读锁检查缓存
 	tc.mutex.RLock()
-	if tc.token != "" && time.Now().Before(tc.expiresAt) && !tc.fetching && !tc.invalidated {
+	if tc.token != "" && time.Now().Before(tc.expiresAt) {
 		token := tc.token
 		tc.mutex.RUnlock()
 		debugLog("使用缓存的匿名token")
 		tokenCacheHits.Add(1)
 		return token, nil
 	}
-	isFetching := tc.fetching
-	lastFetchTime := tc.fetchTime
-	lastFetchErr := tc.fetchErr
 	tc.mutex.RUnlock()
 
-	// 如果正在获取中，使用更好的等待机制
-	if isFetching {
-		// 检查是否已经超时（避免死锁）
-		if time.Since(lastFetchTime) > 30*time.Second {
-			debugLog("检测到token获取超时，尝试重新获取")
-			// 尝试重置状态
-			tc.mutex.Lock()
-			if tc.fetching && time.Since(tc.fetchTime) > 30*time.Second {
-				tc.fetching = false
-				debugLog("重置超时的token获取状态")
-			}
-			tc.mutex.Unlock()
-		} else {
-			// 使用更短的等待时间和退避策略
-			timeout := time.NewTimer(10 * time.Second) // 最多等待10秒
-			defer timeout.Stop()
-
-			ticker := time.NewTicker(50 * time.Millisecond) // 更频繁的检查
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-timeout.C:
-					debugLog("等待token获取超时")
-					// 返回上次的错误或创建新错误
-					if lastFetchErr != nil {
-						return "", fmt.Errorf("token获取超时，上次错误: %v", lastFetchErr)
-					}
-					return "", fmt.Errorf("token获取超时")
-				case <-ticker.C:
-					tc.mutex.RLock()
-					if tc.token != "" && time.Now().Before(tc.expiresAt) && !tc.fetching && !tc.invalidated {
-						token := tc.token
-						tc.mutex.RUnlock()
-						debugLog("等待后使用缓存的匿名token")
-						return token, nil
-					}
-					stillFetching := tc.fetching
-					currentFetchErr := tc.fetchErr
-					tc.mutex.RUnlock()
-
-					if !stillFetching {
-						// 获取完成，检查是否有有效token
-						tc.mutex.RLock()
-						if tc.token != "" && time.Now().Before(tc.expiresAt) && !tc.invalidated {
-							token := tc.token
-							tc.mutex.RUnlock()
-							return token, nil
-						}
-						tc.mutex.RUnlock()
-
-						// 没有有效token，返回获取错误
-						if currentFetchErr != nil {
-							return "", currentFetchErr
-						}
-						break // 退出等待，尝试自己获取
-					}
-				}
-			}
+	// 使用 singleflight 确保只有一个 goroutine 获取 token
+	result, err, _ := tc.sf.Do("get_token", func() (interface{}, error) {
+		// 再次检查缓存，可能在等待期间其他 goroutine 已经获取了
+		tc.mutex.RLock()
+		if tc.token != "" && time.Now().Before(tc.expiresAt) {
+			token := tc.token
+			tc.mutex.RUnlock()
+			debugLog("在 singleflight 中使用缓存的匿名token")
+			return token, nil
 		}
-	}
+		tc.mutex.RUnlock()
 
-	// 尝试获取写锁来获取新token
-	tc.mutex.Lock()
+		// 获取新 token
+		newToken, fetchErr := getAnonymousTokenDirect()
+		if fetchErr != nil {
+			debugLog("获取新的匿名token失败: %v", fetchErr)
+			tokenCacheMisses.Add(1)
+			return "", fetchErr
+		}
 
-	// 双重检查，可能在等待锁的时候其他goroutine已经获取了
-	if tc.token != "" && time.Now().Before(tc.expiresAt) && !tc.invalidated {
-		debugLog("双重检查：使用缓存的匿名token")
-		tokenCacheHits.Add(1)
-		tc.mutex.Unlock()
-		return tc.token, nil
-	}
-
-	// 如果已经有goroutine在获取且未超时，则返回错误
-	if tc.fetching && time.Since(tc.fetchTime) < 30*time.Second {
-		tc.mutex.Unlock()
-		return "", fmt.Errorf("另一个goroutine正在获取token")
-	}
-
-	// 设置获取标记
-	tc.fetching = true
-	tc.fetchTime = time.Now()
-	tc.fetchErr = nil
-	tc.invalidated = false // 清除失效标记
-
-	// 临时释放锁来获取token（避免长时间持有锁）
-	tc.mutex.Unlock()
-	newToken, fetchErr := getAnonymousTokenDirect()
-	tc.mutex.Lock()
-
-	// 记录获取结果
-	tc.fetchErr = fetchErr
-
-	if fetchErr == nil {
+		// 更新缓存
+		tc.mutex.Lock()
 		tc.token = newToken
 		tc.expiresAt = time.Now().Add(5 * time.Minute) // 5分钟缓存
+		tc.mutex.Unlock()
+
 		debugLog("获取新的匿名token成功，缓存5分钟")
 		tokenCacheMisses.Add(1)
-	} else {
-		debugLog("获取新的匿名token失败: %v", fetchErr)
-		tokenCacheMisses.Add(1)
-		// 清理可能的过期token
-		if time.Now().After(tc.expiresAt) {
-			tc.token = ""
-		}
+		return newToken, nil
+	})
+
+	if err != nil {
+		return "", err
 	}
 
-	// 清除获取标记
-	tc.fetching = false
-
-	// 释放锁并返回结果
-	tc.mutex.Unlock()
-	return newToken, fetchErr
+	return result.(string), nil
 }
 
 // InvalidateToken 立即将当前token标记为失效，强制获取新token
 func (tc *TokenCache) InvalidateToken() {
 	tc.mutex.Lock()
 	defer tc.mutex.Unlock()
-	tc.invalidated = true
 	tc.token = ""
 	tc.expiresAt = time.Now() // 设置为已过期
 	debugLog("匿名token已标记为失效，下次请求将获取新token")
@@ -2551,8 +1853,10 @@ func handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	stats.mutex.RLock()
 	defer stats.mutex.RUnlock()
 
+	// 创建统计管理器实例
+	statsManager := NewStatsManager()
 	// Get top 3 models
-	topModels := getTopModels()
+	topModels := statsManager.GetTopModels()
 
 	// Create a serializable stats response
 	statsResponse := map[string]interface{}{
@@ -2787,16 +2091,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	debugLog("API key验证通过")
 
-	// 解析请求 - 使用对象池优化
+	// 解析请求 - 使用流式解码器优化内存使用
 	var req OpenAIRequest
-	reqBody, err := io.ReadAll(r.Body)
-	if err != nil {
-		globalErrorHandler.HandleAPIError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body", "读取请求体失败: %v", err)
-		requestErrors.Add("invalid_request_error", 1)
-		return
-	}
-	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
-	if err := sonic.Unmarshal(reqBody, &req); err != nil {
+	decoder := sonic.ConfigStd.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
@@ -3283,10 +2581,11 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	var sentInitialAnswer bool
 	var sentFinish bool // 追踪是否已发送结束块
 
-	// 创建工具调用处理器
-	toolCallHandler := NewSSEToolCallHandler()
+	// 用于跟踪工具调用的状态
+	var toolCalls []ToolCall
 
-	// sonic.Decoder is not used in this function, removing the pool get/put.
+	// 不使用 sonic.Decoder 池，直接使用 sonic.Unmarshal
+	// 因为 sonic.Decoder 的 Reset 方法不适合频繁重置
 
 	// 创建一个缓冲读取器来处理 SSE 格式
 	bufReader := bufio.NewReader(resp.Body)
@@ -3341,6 +2640,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			continue
 		}
 
+		// 使用 sonic.Unmarshal 直接解析 JSON
 		var upstreamData UpstreamData
 		if err := sonic.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
 			debugLog("SSE数据解析失败: %v", err)
@@ -3429,9 +2729,8 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		// 优先按Phase分流处理
 		switch upstreamData.Data.Phase {
 		case "tool_call":
-			// 无论DeltaContent是否为空，都处理工具调用
-			toolCalls, err := toolCallHandler.process(upstreamData.Data.EditIndex, upstreamData.Data.EditContent)
-			if err == nil && len(toolCalls) > 0 {
+			// 处理工具调用 - 直接使用 sonic 解析的 ToolCalls
+			if len(upstreamData.Data.ToolCalls) > 0 {
 				chunk := OpenAIResponse{
 					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 					Object:  "chat.completion.chunk",
@@ -3442,13 +2741,16 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 							Index: 0,
 							Delta: Delta{
 								Role:      "assistant",
-								ToolCalls: toolCalls,
+								ToolCalls: upstreamData.Data.ToolCalls,
 							},
 						},
 					},
 				}
 				writeSSEChunk(w, chunk)
 				flusher.Flush()
+
+				// 保存工具调用状态
+				toolCalls = append(toolCalls, upstreamData.Data.ToolCalls...)
 			}
 		case "thinking":
 			if upstreamData.Data.DeltaContent != "" {
@@ -3472,7 +2774,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 
 		if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
 			// 检查是否有工具调用需要完成
-			if len(toolCallHandler.GetToolCalls()) > 0 && !sentFinish {
+			if len(toolCalls) > 0 && !sentFinish {
 				// 发送工具调用完成信号
 				endChunk := OpenAIResponse{
 					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
@@ -3496,7 +2798,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 
 	// 根据是否有工具调用决定结束原因
 	finishReason := "stop"
-	if len(toolCallHandler.GetToolCalls()) > 0 {
+	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
 	}
 
@@ -3607,7 +2909,8 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	}
 
 	var contentBuffer []byte
-	toolCallHandler := NewSSEToolCallHandler() // 使用工具调用处理器以实现鲁棒的合并
+	// 用于跟踪工具调用的状态
+	var toolCalls []ToolCall
 	lastUsage := Usage{}
 
 	debugLog("开始收集完整响应内容")
@@ -3616,7 +2919,8 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	lineCount := 0
 	var upstreamError *UpstreamError // 用于存储上游错误信息
 
-	// sonic.Decoder is not used in this function, removing the pool get/put.
+	// 不使用 sonic.Decoder 池，直接使用 sonic.Unmarshal
+	// 因为 sonic.Decoder 的 Reset 方法不适合频繁重置
 
 	// 创建一个缓冲读取器来处理 SSE 格式
 	bufReader := bufio.NewReader(resp.Body)
@@ -3667,6 +2971,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 			continue
 		}
 
+		// 使用 sonic.Unmarshal 直接解析 JSON
 		var upstreamData UpstreamData
 		if err := sonic.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
 			debugLog("SSE数据解析失败 (第%d行): %v, 数据: %s", lineCount, err, dataStr)
@@ -3708,9 +3013,9 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 			lastUsage = upstreamData.Data.Usage
 		}
 
-		// 使用SSEToolCallHandler处理工具调用，以确保参数的最终状态
-		if upstreamData.Data.Phase == "tool_call" && upstreamData.Data.EditContent != "" {
-			toolCallHandler.process(upstreamData.Data.EditIndex, upstreamData.Data.EditContent)
+		// 处理工具调用 - 直接使用 sonic 解析的 ToolCalls
+		if upstreamData.Data.Phase == "tool_call" && len(upstreamData.Data.ToolCalls) > 0 {
+			toolCalls = append(toolCalls, upstreamData.Data.ToolCalls...)
 		}
 
 		// Capture content from multiple possible sources to ensure we get the response
@@ -3802,7 +3107,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	}
 
 	finalContent := string(bytes.ReplaceAll(contentBuffer, []byte{0}, []byte{}))
-	finalToolCalls := toolCallHandler.GetToolCalls()
+	finalToolCalls := toolCalls
 	debugLog("内容收集完成，总共处理%d行，最终长度: %d, 工具调用数: %d", lineCount, len(finalContent), len(finalToolCalls))
 
 	// 检查是否有错误发生

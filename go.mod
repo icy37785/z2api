@@ -3,10 +3,10 @@ module z2api
 go 1.25.2
 
 require (
-    github.com/andybalholm/brotli v1.2.0
+	github.com/andybalholm/brotli v1.2.0
+	github.com/bytedance/sonic v1.14.1
 	github.com/google/uuid v1.6.0
 	golang.org/x/sync v0.17.0
-	github.com/bytedance/sonic v1.14.1
 )
 
 require (
