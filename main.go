@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"expvar"
 	"fmt"
 	"hash/fnv"
@@ -24,6 +23,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	json "github.com/bytedance/sonic"
 
 	// 添加Brotli支持
 	"z2api/config"
@@ -226,7 +227,7 @@ var (
 
 // 伪装前端头部（来自抓包） - now loaded from fingerprints.json
 var (
-	DefaultXFeVersion = "prod-fe-1.0.70"
+	DefaultXFeVersion = "prod-fe-1.0.95"
 	DefaultSecChUaMob = "?0"
 )
 
@@ -297,13 +298,6 @@ var (
 	bytesBufferPool = sync.Pool{
 		New: func() interface{} {
 			return bytes.NewBuffer(make([]byte, 0, 1024)) // 预分配1KB
-		},
-	}
-
-	// JSON 解码器对象池
-	jsonDecoderPool = sync.Pool{
-		New: func() interface{} {
-			return json.NewDecoder(strings.NewReader(""))
 		},
 	}
 
@@ -2159,9 +2153,11 @@ func (eh *ErrorHandler) HandleAPIError(w http.ResponseWriter, statusCode int, er
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	if err := json.NewEncoder(w).Encode(errorResponse); err != nil {
+	if data, err := json.Marshal(errorResponse); err != nil {
 		debugLog("编码错误响应失败: %v", err)
-		// 降级为简单错误响应
+		http.Error(w, message, statusCode)
+	} else if _, err := w.Write(data); err != nil {
+		debugLog("写入错误响应失败: %v", err)
 		http.Error(w, message, statusCode)
 	}
 }
@@ -2187,9 +2183,11 @@ func (eh *ErrorHandler) HandleUpstreamError(w http.ResponseWriter, err *Upstream
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadGateway)
-	if encodeErr := json.NewEncoder(w).Encode(errorResponse); encodeErr != nil {
+	if data, encodeErr := json.Marshal(errorResponse); encodeErr != nil {
 		debugLog("编码上游错误响应失败: %v", encodeErr)
-		// 降级为简单错误响应
+		http.Error(w, err.Detail, http.StatusBadGateway)
+	} else if _, writeErr := w.Write(data); writeErr != nil {
+		debugLog("写入上游错误响应失败: %v", writeErr)
 		http.Error(w, err.Detail, http.StatusBadGateway)
 	}
 }
@@ -2495,7 +2493,11 @@ func getAnonymousTokenDirect() (string, error) {
 	var body struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if err := json.Unmarshal(respBody, &body); err != nil {
 		return "", err
 	}
 	if body.Token == "" {
@@ -2657,7 +2659,13 @@ func handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(statsResponse)
+	if data, err := json.Marshal(statsResponse); err != nil {
+		debugLog("编码统计响应失败: %v", err)
+		http.Error(w, "Failed to encode stats", http.StatusInternalServerError)
+	} else if _, err := w.Write(data); err != nil {
+		debugLog("写入统计响应失败: %v", err)
+		http.Error(w, "Failed to write stats", http.StatusInternalServerError)
+	}
 }
 
 // handleDashboardRequests handles the dashboard live requests endpoint
@@ -2680,9 +2688,12 @@ func handleDashboardRequests(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(requests); err != nil {
+	if data, err := json.Marshal(requests); err != nil {
 		debugLog("Failed to encode live requests: %v", err)
 		http.Error(w, "Failed to encode requests", http.StatusInternalServerError)
+	} else if _, err := w.Write(data); err != nil {
+		debugLog("Failed to write live requests: %v", err)
+		http.Error(w, "Failed to write requests", http.StatusInternalServerError)
 	}
 }
 
@@ -2734,7 +2745,13 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(healthResponse)
+	if data, err := json.Marshal(healthResponse); err != nil {
+		debugLog("编码健康检查响应失败: %v", err)
+		http.Error(w, "Failed to encode health", http.StatusInternalServerError)
+	} else if _, err := w.Write(data); err != nil {
+		debugLog("写入健康检查响应失败: %v", err)
+		http.Error(w, "Failed to write health", http.StatusInternalServerError)
+	}
 }
 
 func setCORSHeaders(w http.ResponseWriter) {
@@ -2758,7 +2775,13 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	response := getModelsList()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	if data, err := json.Marshal(response); err != nil {
+		debugLog("编码模型列表响应失败: %v", err)
+		http.Error(w, "Failed to encode models", http.StatusInternalServerError)
+	} else if _, err := w.Write(data); err != nil {
+		debugLog("写入模型列表响应失败: %v", err)
+		http.Error(w, "Failed to write models", http.StatusInternalServerError)
+	}
 
 	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 	recordRequestStats(startTime, r.URL.Path, http.StatusOK, 0, "", false)
@@ -2847,7 +2870,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 解析请求 - 使用对象池优化
 	var req OpenAIRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	reqBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		globalErrorHandler.HandleAPIError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body", "读取请求体失败: %v", err)
+		requestErrors.Add("invalid_request_error", 1)
+		return
+	}
+	if err := json.Unmarshal(reqBody, &req); err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
@@ -3002,14 +3031,17 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 		bytesBufferPool.Put(buf)
 	}()
 
-	if err := json.NewEncoder(buf).Encode(upstreamReq); err != nil {
+	var data []byte
+	var err error
+	if data, err = json.Marshal(upstreamReq); err != nil {
 		debugLog("上游请求序列化失败: %v", err)
 		cancel() // 手动取消上下文
 		return nil, nil, err
 	}
-
+	buf.Write(data)
+	data = buf.Bytes()
 	debugLog("调用上游API: %s (超时: %v)", appConfig.UpstreamUrl, timeout)
-	debugLog("上游请求体: %s", maskJSONForLogging(buf.String()))
+	debugLog("上游请求体: %s", maskJSONForLogging(string(data)))
 
 	// 生成签名所需的参数
 	requestID := uuid.New().String()
@@ -3070,7 +3102,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	debugLog("构建的完整URL: %s", upstreamURL)
 	debugLog("查询参数: user_id=%s, current_url=%s, pathname=%s", userID, currentURL, pathname)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(buf.Bytes()))
+	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(data))
 	if err != nil {
 		debugLog("创建HTTP请求失败: %v", err)
 		cancel() // 手动取消上下文
@@ -3869,7 +3901,13 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		if data, err := json.Marshal(response); err != nil {
+			debugLog("编码非流式响应失败: %v", err)
+			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		} else if _, err := w.Write(data); err != nil {
+			debugLog("写入非流式响应失败: %v", err)
+			http.Error(w, "Failed to write response", http.StatusInternalServerError)
+		}
 		debugLog("非流式响应发送完成")
 	}
 

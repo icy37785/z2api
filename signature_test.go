@@ -2,10 +2,11 @@ package main
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
+
+	json "github.com/bytedance/sonic"
 )
 
 // TestDecodeJWT 测试 JWT 解码功能

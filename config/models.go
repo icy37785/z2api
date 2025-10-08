@@ -1,10 +1,11 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
+
+	json "github.com/bytedance/sonic"
 )
 
 // ModelCapabilities 定义了模型的能力

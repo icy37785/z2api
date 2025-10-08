@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +10,8 @@ import (
 	"z2api/config"
 
 	"golang.org/x/sync/semaphore"
+
+	json "github.com/bytedance/sonic"
 )
 
 func TestMain(m *testing.M) {

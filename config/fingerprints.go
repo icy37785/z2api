@@ -1,13 +1,14 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"os"
 	"sync"
 	"time"
+
+	json "github.com/bytedance/sonic"
 )
 
 // Metadata contains descriptive info about the fingerprints file.

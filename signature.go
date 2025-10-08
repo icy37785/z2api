@@ -4,9 +4,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"strings"
+
+	json "github.com/bytedance/sonic"
 )
 
 // JWTPayload 表示 JWT token 的 payload 部分
