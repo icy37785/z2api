@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/sync/semaphore"
 
-	json "github.com/bytedance/sonic"
+	"github.com/bytedance/sonic"
 )
 
 func TestMain(m *testing.M) {
@@ -143,7 +143,7 @@ func TestChatCompletions(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			body, _ := json.Marshal(tc.requestBody)
+			body, _ := sonic.Marshal(tc.requestBody)
 			req, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewBuffer(body))
 			req.Header.Set("Authorization", "Bearer "+appConfig.DefaultKey)
 			rr := httptest.NewRecorder()

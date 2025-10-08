@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	json "github.com/bytedance/sonic"
+	"github.com/bytedance/sonic"
 )
 
 // ModelCapabilities 定义了模型的能力
@@ -42,7 +42,7 @@ func LoadModels(path string) error {
 	}
 
 	var data ModelsData
-	if err := json.Unmarshal(file, &data); err != nil {
+	if err := sonic.Unmarshal(file, &data); err != nil {
 		return fmt.Errorf("failed to parse models JSON: %w", err)
 	}
 

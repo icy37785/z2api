@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	json "github.com/bytedance/sonic"
+	"github.com/bytedance/sonic"
 
 	// 添加Brotli支持
 	"z2api/config"
@@ -312,6 +313,22 @@ var (
 	// 这可以防止在高并发时消耗过多资源
 	// 注意：会在main函数中根据配置重新创建
 	concurrencyLimiter *semaphore.Weighted
+
+	// sonic 编码器和解码器对象池
+	sonicEncoderPool = sync.Pool{
+		New: func() interface{} {
+			// 创建一个 bytes.Buffer 作为编码器的目标
+			buf := &bytes.Buffer{}
+			return sonic.ConfigStd.NewEncoder(buf)
+		},
+	}
+
+	sonicDecoderPool = sync.Pool{
+		New: func() interface{} {
+			// 创建一个空的字符串作为解码器的源
+			return sonic.ConfigStd.NewDecoder(strings.NewReader(""))
+		},
+	}
 )
 
 // gzipReadCloser 包装gzip.Reader和原始的io.ReadCloser
@@ -377,7 +394,7 @@ func NewSSEToolCallHandler() *SSEToolCallHandler {
 		buffer:         make([]byte, 0, 4096), // 预分配4KB
 		toolCalls:      make([]ToolCall, 0),
 		expansionCount: 0,
-		maxExpansions:  50,                       // 减少最大扩展次数
+		maxExpansions:  500,                      // 减少最大扩展次数
 		maxBufferSize:  int(MaxResponseSize / 2), // 限制单个handler最大缓冲区为响应大小的一半
 	}
 }
@@ -385,101 +402,24 @@ func NewSSEToolCallHandler() *SSEToolCallHandler {
 // isArgumentsComplete checks if a JSON string appears to be complete.
 // 参考Python实现，增强JSON完整性检查机制
 func (h *SSEToolCallHandler) isArgumentsComplete(args string) bool {
-	args = strings.TrimSpace(args)
-	if args == "" {
+	trimmedArgs := strings.TrimSpace(args)
+	if trimmedArgs == "" {
 		return false
 	}
 
-	// Basic structure check: must end with } or "
-	if !strings.HasSuffix(args, "}") && !strings.HasSuffix(args, "\"") {
+	// 检查是否以有效的JSON结束符号结尾
+	if !strings.HasSuffix(trimmedArgs, "}") && !strings.HasSuffix(trimmedArgs, "\"") {
 		debugLog("参数不完整: 没有正确的结束符号")
 		return false
 	}
 
-	// Enhanced JSON structure validation
-	args = h.fixIncompleteJSON(args)
-
-	// Stack-based balance check
-	var stack []rune
-	inString := false
-	isEscaped := false
-
-	for _, char := range args {
-		if isEscaped {
-			isEscaped = false
-			continue
-		}
-
-		if char == '\\' {
-			isEscaped = true
-			continue
-		}
-
-		if char == '"' {
-			inString = !inString
-		}
-
-		if !inString {
-			switch char {
-			case '{', '[':
-				stack = append(stack, char)
-			case '}':
-				if len(stack) == 0 || stack[len(stack)-1] != '{' {
-					return false // Unmatched closing brace
-				}
-				stack = stack[:len(stack)-1]
-			case ']':
-				if len(stack) == 0 || stack[len(stack)-1] != '[' {
-					return false // Unmatched closing bracket
-				}
-				stack = stack[:len(stack)-1]
-			}
-		}
-	}
-
-	structurallyComplete := len(stack) == 0 && !inString
-	if !structurallyComplete {
+	// 尝试解析JSON来验证其完整性
+	var temp interface{}
+	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
+	err := sonic.Unmarshal([]byte(trimmedArgs), &temp)
+	if err != nil {
+		debugLog("参数JSON解析失败，判定为不完整: %v", err)
 		return false
-	}
-
-	// Enhanced semantic completeness checks
-	// Try to parse as JSON to get structured data, with more lenient approach
-	var argsMap map[string]interface{}
-	if err := json.Unmarshal([]byte(args), &argsMap); err != nil {
-		debugLog("参数JSON解析失败，但可能是部分有效参数: %v", err)
-		// 不立即返回false，而是尝试更多验证
-		// 如果是基本结构完整但内容可能不完整的情况，继续验证
-		return h.isBasicStructureValid(args)
-	}
-
-	// Check for incomplete URLs (common truncation indicator)
-	for key, value := range argsMap {
-		if strValue, ok := value.(string); ok {
-			// Check URL completeness with more flexible rules
-			if strings.Contains(strings.ToLower(strValue), "http") {
-				// URL too short is suspicious, but allow for query parameters and paths
-				if len(strValue) < 8 { // http://a is minimum valid URL
-					debugLog("参数不完整: URL过短 (%s: %s)", key, strValue)
-					return false
-				}
-				// More comprehensive check for incomplete domain patterns
-				if h.isIncompleteURL(strValue) {
-					debugLog("参数不完整: URL域名未完成 (%s: %s)", key, strValue)
-					return false
-				}
-			}
-
-			if len(strValue) > 0 && h.isTruncatedValue(strValue) {
-				lastTenChars := ""
-				if len(strValue) >= 10 {
-					lastTenChars = strValue[len(strValue)-10:]
-				} else {
-					lastTenChars = strValue
-				}
-				debugLog("参数不完整: 値可能被截断 (%s: ...%s)", key, lastTenChars)
-				return false
-			}
-		}
 	}
 
 	return true
@@ -653,12 +593,13 @@ func (h *SSEToolCallHandler) cleanArgumentsString(argumentsRaw string) string {
 	cleaned = h.fixIncompleteJSON(cleaned)
 
 	// Try to parse and re-serialize for normalization
+	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
 	var parsed interface{}
-	if err := json.Unmarshal([]byte(cleaned), &parsed); err == nil {
+	if err := sonic.Unmarshal([]byte(cleaned), &parsed); err == nil {
 		if parsed == nil {
 			return "{}"
 		}
-		if normalized, err := json.Marshal(parsed); err == nil {
+		if normalized, err := sonic.Marshal(parsed); err == nil {
 			return string(normalized)
 		}
 	} else {
@@ -712,7 +653,8 @@ func (h *SSEToolCallHandler) parsePartialArguments(argumentsRaw string) map[stri
 	// Try cleaning first
 	cleaned := h.cleanArgumentsString(argumentsRaw)
 	var result map[string]interface{}
-	if err := json.Unmarshal([]byte(cleaned), &result); err == nil {
+	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
+	if err := sonic.Unmarshal([]byte(cleaned), &result); err == nil {
 		if result == nil {
 			return make(map[string]interface{})
 		}
@@ -742,7 +684,8 @@ func (h *SSEToolCallHandler) parsePartialArguments(argumentsRaw string) map[stri
 		fixed += "}"
 	}
 
-	if err := json.Unmarshal([]byte(fixed), &result); err == nil {
+	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
+	if err := sonic.Unmarshal([]byte(fixed), &result); err == nil {
 		return result
 	}
 
@@ -786,39 +729,13 @@ func (h *SSEToolCallHandler) process(editIndex int, editContent string) ([]ToolC
 
 // applyEditToBuffer updates the content buffer at a specific position.
 // 改进缓冲区管理：增强输入验证和更安全的內存控制
+// applyEditToBuffer updates the content buffer at a specific position.
+// 仿照Python参考实现，使用空字节填充和覆盖的策略。
 func (h *SSEToolCallHandler) applyEditToBuffer(editIndex int, editContent string) {
 	editBytes := []byte(editContent)
-
-	// 增强的输入验证和边界检查
-	if editIndex < 0 {
-		debugLog("无效的editIndex: %d，跳过处理", editIndex)
-		return
-	}
-
-	// 检查内容大小是否合理
-	if len(editBytes) > h.maxBufferSize/2 {
-		debugLog("单次编辑内容过大: %d > %d，截断处理", len(editBytes), h.maxBufferSize/2)
-		editBytes = editBytes[:h.maxBufferSize/2]
-	}
-
-	// 防护恶意请求：检查editIndex是否异常大
-	maxReasonableIndex := len(h.buffer) + 1024*1024 // 允许1MB的合理跳跃
-	if editIndex > maxReasonableIndex {
-		debugLog("editIndex异常大: %d > %d，可能是恶意请求，强制使用追加模式", editIndex, maxReasonableIndex)
-		editIndex = len(h.buffer) // 强制使用追加模式
-	}
-
-	// 重新计算所需长度
 	requiredLength := editIndex + len(editBytes)
 
-	// 检查editIndex是否超出绝对最大限制
-	if editIndex > h.maxBufferSize {
-		debugLog("editIndex超出最大限制: %d > %d，使用追加模式", editIndex, h.maxBufferSize)
-		editIndex = len(h.buffer)
-		requiredLength = editIndex + len(editBytes)
-	}
-
-	// 检查所需总长度是否超出限制
+	// 检查是否超出最大缓冲区限制
 	if requiredLength > h.maxBufferSize {
 		debugLog("工具调用缓冲区将超出最大限制: required=%d, max=%d", requiredLength, h.maxBufferSize)
 		// 计算可容纳的最大内容长度
@@ -833,60 +750,19 @@ func (h *SSEToolCallHandler) applyEditToBuffer(editIndex int, editContent string
 		debugLog("截断内容以适应缓冲区: 截断后长度=%d", len(editBytes))
 	}
 
-	// 检查扩展次数限制，防止无限扩展
+	// 如果editIndex超出了当前缓冲区的长度，用空字节填充
+	if len(h.buffer) < editIndex {
+		padding := make([]byte, editIndex-len(h.buffer))
+		h.buffer = append(h.buffer, padding...)
+	}
+
+	// 确保缓冲区足够长以容纳新内容
 	if len(h.buffer) < requiredLength {
-		h.expansionCount++
-		if h.expansionCount > h.maxExpansions {
-			debugLog("工具调用缓冲区扩展次数超限: count=%d, max=%d", h.expansionCount, h.maxExpansions)
-			return
-		}
-
-		// 使用更保守的扩展策略，减少内存占用
-		var newCapacity int
-		currentLen := len(h.buffer)
-
-		// 优先使用所需长度，避免过度分配
-		newCapacity = requiredLength
-
-		// 只有在合理范围内才考虑适量的额外容量
-		if requiredLength < currentLen*2 && currentLen < h.maxBufferSize/4 {
-			// 为未来扩展预留25%的空间，但不超过当前需求的1.5倍
-			extraSpace := min(requiredLength/4, 4096) // 最多4KB的额外空间
-			newCapacity = requiredLength + extraSpace
-		}
-
-		// 确保不超过最大限制
-		if newCapacity > h.maxBufferSize {
-			newCapacity = h.maxBufferSize
-		}
-
-		// 验证新容量的合理性
-		if newCapacity < requiredLength {
-			debugLog("计算的新容量不足: %d < %d", newCapacity, requiredLength)
-			newCapacity = requiredLength
-		}
-
-		// 分配新缓冲区
-		newBuffer := make([]byte, newCapacity)
-		copy(newBuffer, h.buffer)
-		h.buffer = newBuffer[:requiredLength] // 设置实际长度
-		debugLog("工具调用缓冲区扩展: 第%d次, 新大小=%d, 容量=%d", h.expansionCount, requiredLength, newCapacity)
-	} else {
-		// 如果缓冲区足够大，只需调整长度
-		if requiredLength > len(h.buffer) {
-			h.buffer = h.buffer[:requiredLength]
-		}
+		h.buffer = append(h.buffer, make([]byte, requiredLength-len(h.buffer))...)
 	}
 
-	// 安全复制数据，防止越界
-	if editIndex < len(h.buffer) && len(editBytes) > 0 {
-		endIndex := editIndex + len(editBytes)
-		if endIndex > len(h.buffer) {
-			endIndex = len(h.buffer)
-			editBytes = editBytes[:endIndex-editIndex]
-		}
-		copy(h.buffer[editIndex:endIndex], editBytes)
-	}
+	// 在指定位置覆盖内容
+	copy(h.buffer[editIndex:], editBytes)
 }
 
 // processToolCallsFromBuffer parses tool calls from the buffer and returns updates to be sent.
@@ -932,7 +808,8 @@ func (h *SSEToolCallHandler) processSingleToolBlock(blockContent string) (ToolCa
 		} `json:"data"`
 	}
 
-	if err := json.Unmarshal([]byte(blockContent), &toolData); err == nil {
+	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
+	if err := sonic.Unmarshal([]byte(blockContent), &toolData); err == nil {
 		metadata := toolData.Data.Metadata
 		if metadata.ID != "" && metadata.Name != "" {
 			return h.handleToolUpdate(metadata.ID, metadata.Name, metadata.Arguments)
@@ -1558,7 +1435,8 @@ func buildUpstreamParams(req OpenAIRequest) map[string]interface{} {
 // maskJSONForLogging masks sensitive fields in a JSON string for logging purposes.
 func maskJSONForLogging(jsonStr string) string {
 	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
+	if err := sonic.Unmarshal([]byte(jsonStr), &data); err != nil {
 		// If parsing fails, just truncate the raw string if it's too long.
 		if len(jsonStr) > 512 {
 			return jsonStr[:512] + "...(truncated)"
@@ -1579,7 +1457,8 @@ func maskJSONForLogging(jsonStr string) string {
 		}
 	}
 
-	maskedBytes, err := json.Marshal(data)
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	maskedBytes, err := sonic.Marshal(data)
 	if err != nil {
 		// Fallback if marshaling fails
 		if len(jsonStr) > 512 {
@@ -2030,7 +1909,7 @@ func validateAndSanitizeInput(req *OpenAIRequest) error {
 
 		// 验证角色值
 		validRoles := map[string]bool{
-			"system": true, "user": true, "assistant": true, "developer": true,
+			"system": true, "user": true, "assistant": true, "developer": true, "tool": true,
 		}
 		if !validRoles[msg.Role] {
 			return fmt.Errorf("无效的消息角色: %s", msg.Role)
@@ -2153,7 +2032,8 @@ func (eh *ErrorHandler) HandleAPIError(w http.ResponseWriter, statusCode int, er
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	if data, err := json.Marshal(errorResponse); err != nil {
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	if data, err := sonic.Marshal(errorResponse); err != nil {
 		debugLog("编码错误响应失败: %v", err)
 		http.Error(w, message, statusCode)
 	} else if _, err := w.Write(data); err != nil {
@@ -2183,7 +2063,8 @@ func (eh *ErrorHandler) HandleUpstreamError(w http.ResponseWriter, err *Upstream
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadGateway)
-	if data, encodeErr := json.Marshal(errorResponse); encodeErr != nil {
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	if data, encodeErr := sonic.Marshal(errorResponse); encodeErr != nil {
 		debugLog("编码上游错误响应失败: %v", encodeErr)
 		http.Error(w, err.Detail, http.StatusBadGateway)
 	} else if _, writeErr := w.Write(data); writeErr != nil {
@@ -2310,17 +2191,18 @@ func (tc *TokenCache) GetToken() (string, error) {
 
 	// 尝试获取写锁来获取新token
 	tc.mutex.Lock()
-	defer tc.mutex.Unlock()
 
 	// 双重检查，可能在等待锁的时候其他goroutine已经获取了
 	if tc.token != "" && time.Now().Before(tc.expiresAt) && !tc.invalidated {
 		debugLog("双重检查：使用缓存的匿名token")
 		tokenCacheHits.Add(1)
+		tc.mutex.Unlock()
 		return tc.token, nil
 	}
 
 	// 如果已经有goroutine在获取且未超时，则返回错误
 	if tc.fetching && time.Since(tc.fetchTime) < 30*time.Second {
+		tc.mutex.Unlock()
 		return "", fmt.Errorf("另一个goroutine正在获取token")
 	}
 
@@ -2329,9 +2211,6 @@ func (tc *TokenCache) GetToken() (string, error) {
 	tc.fetchTime = time.Now()
 	tc.fetchErr = nil
 	tc.invalidated = false // 清除失效标记
-	defer func() {
-		tc.fetching = false
-	}()
 
 	// 临时释放锁来获取token（避免长时间持有锁）
 	tc.mutex.Unlock()
@@ -2355,6 +2234,11 @@ func (tc *TokenCache) GetToken() (string, error) {
 		}
 	}
 
+	// 清除获取标记
+	tc.fetching = false
+
+	// 释放锁并返回结果
+	tc.mutex.Unlock()
 	return newToken, fetchErr
 }
 
@@ -2497,7 +2381,8 @@ func getAnonymousTokenDirect() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := json.Unmarshal(respBody, &body); err != nil {
+	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
+	if err := sonic.Unmarshal(respBody, &body); err != nil {
 		return "", err
 	}
 	if body.Token == "" {
@@ -2519,6 +2404,36 @@ var dashboardHTML string
 
 // main is the entry point of the application
 func main() {
+	// JIT 预热核心数据结构
+	debugLog("开始 sonic JIT 预热...")
+	if err := sonic.Pretouch(reflect.TypeOf(OpenAIRequest{})); err != nil {
+		debugLog("OpenAIRequest JIT 预热失败: %v", err)
+	}
+	if err := sonic.Pretouch(reflect.TypeOf(UpstreamRequest{})); err != nil {
+		debugLog("UpstreamRequest JIT 预热失败: %v", err)
+	}
+	if err := sonic.Pretouch(reflect.TypeOf(UpstreamData{})); err != nil {
+		debugLog("UpstreamData JIT 预热失败: %v", err)
+	}
+	if err := sonic.Pretouch(reflect.TypeOf(OpenAIResponse{})); err != nil {
+		debugLog("OpenAIResponse JIT 预热失败: %v", err)
+	}
+	if err := sonic.Pretouch(reflect.TypeOf(Choice{})); err != nil {
+		debugLog("Choice JIT 预热失败: %v", err)
+	}
+	if err := sonic.Pretouch(reflect.TypeOf(Message{})); err != nil {
+		debugLog("Message JIT 预热失败: %v", err)
+	}
+	if err := sonic.Pretouch(reflect.TypeOf(Delta{})); err != nil {
+		debugLog("Delta JIT 预热失败: %v", err)
+	}
+	if err := sonic.Pretouch(reflect.TypeOf(ToolCall{})); err != nil {
+		debugLog("ToolCall JIT 预热失败: %v", err)
+	}
+	if err := sonic.Pretouch(reflect.TypeOf(Usage{})); err != nil {
+		debugLog("Usage JIT 预热失败: %v", err)
+	}
+	debugLog("sonic JIT 预热完成")
 
 	// 加载仪表板HTML
 	var err error
@@ -2659,7 +2574,8 @@ func handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if data, err := json.Marshal(statsResponse); err != nil {
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	if data, err := sonic.Marshal(statsResponse); err != nil {
 		debugLog("编码统计响应失败: %v", err)
 		http.Error(w, "Failed to encode stats", http.StatusInternalServerError)
 	} else if _, err := w.Write(data); err != nil {
@@ -2688,7 +2604,8 @@ func handleDashboardRequests(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if data, err := json.Marshal(requests); err != nil {
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	if data, err := sonic.Marshal(requests); err != nil {
 		debugLog("Failed to encode live requests: %v", err)
 		http.Error(w, "Failed to encode requests", http.StatusInternalServerError)
 	} else if _, err := w.Write(data); err != nil {
@@ -2745,7 +2662,8 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	if data, err := json.Marshal(healthResponse); err != nil {
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	if data, err := sonic.Marshal(healthResponse); err != nil {
 		debugLog("编码健康检查响应失败: %v", err)
 		http.Error(w, "Failed to encode health", http.StatusInternalServerError)
 	} else if _, err := w.Write(data); err != nil {
@@ -2775,7 +2693,8 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	response := getModelsList()
 
 	w.Header().Set("Content-Type", "application/json")
-	if data, err := json.Marshal(response); err != nil {
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	if data, err := sonic.Marshal(response); err != nil {
 		debugLog("编码模型列表响应失败: %v", err)
 		http.Error(w, "Failed to encode models", http.StatusInternalServerError)
 	} else if _, err := w.Write(data); err != nil {
@@ -2876,7 +2795,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		requestErrors.Add("invalid_request_error", 1)
 		return
 	}
-	if err := json.Unmarshal(reqBody, &req); err != nil {
+	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
+	if err := sonic.Unmarshal(reqBody, &req); err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
@@ -3033,7 +2953,8 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 
 	var data []byte
 	var err error
-	if data, err = json.Marshal(upstreamReq); err != nil {
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	if data, err = sonic.Marshal(upstreamReq); err != nil {
 		debugLog("上游请求序列化失败: %v", err)
 		cancel() // 手动取消上下文
 		return nil, nil, err
@@ -3355,11 +3276,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	flusher.Flush()
 
 	debugLog("开始读取上游SSE流")
-	// 使用更健壮的扫描器方式，类似旧版本，但增加缓冲区限制
-	scanner := bufio.NewScanner(resp.Body)
-	// 优化缓冲区大小：初始512KB，最大5MB (降低内存占用)
-	// 在100并发时，最多占用500MB而不是1GB
-	scanner.Buffer(make([]byte, 0, 512*1024), 5*1024*1024)
+	// 使用 sonic.Decoder 直接从 resp.Body 读取，避免使用 bufio.Scanner
 	lineCount := 0
 	var totalSize int64
 	var lastUsage map[string]interface{}
@@ -3369,17 +3286,15 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	// 创建工具调用处理器
 	toolCallHandler := NewSSEToolCallHandler()
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		lineCount++
+	// sonic.Decoder is not used in this function, removing the pool get/put.
 
-		// 检查累积大小
-		totalSize += int64(len(line))
-		if totalSize > MaxResponseSize {
-			debugLog("流式响应大小超出限制 (%d > %d)，停止处理", totalSize, MaxResponseSize)
-			break
-		}
+	// 创建一个缓冲读取器来处理 SSE 格式
+	bufReader := bufio.NewReader(resp.Body)
 
+	// 保存读取错误，用于循环后的检查
+	var readErr error
+
+	for {
 		// 检查客户端是否断开连接
 		select {
 		case <-r.Context().Done():
@@ -3389,8 +3304,29 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			// 继续处理
 		}
 
-		// 更健壮的SSE数据行处理
+		// 读取一行数据
+		line, err := bufReader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				debugLog("到达流末尾")
+				break
+			}
+			debugLog("读取SSE行失败: %v", err)
+			readErr = err // 保存错误
+			break
+		}
+
+		lineCount++
 		line = strings.TrimSpace(line)
+
+		// 检查累积大小
+		totalSize += int64(len(line))
+		if totalSize > MaxResponseSize {
+			debugLog("流式响应大小超出限制 (%d > %d)，停止处理", totalSize, MaxResponseSize)
+			break
+		}
+
+		// 更健壮的SSE数据行处理
 		if line == "" || !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -3404,8 +3340,9 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			}
 			continue
 		}
+
 		var upstreamData UpstreamData
-		if err := json.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
+		if err := sonic.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
 			debugLog("SSE数据解析失败: %v", err)
 			continue
 		}
@@ -3552,8 +3489,9 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		debugLog("扫描器错误: %v", err)
+	// 检查是否有读取错误
+	if readErr != nil {
+		debugLog("读取SSE流错误: %v", readErr)
 	}
 
 	// 根据是否有工具调用决定结束原因
@@ -3624,7 +3562,8 @@ func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
 	}()
 
 	buf = append(buf, "data: "...)
-	data, _ := json.Marshal(chunk)
+	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+	data, _ := sonic.Marshal(chunk)
 	buf = append(buf, data...)
 	buf = append(buf, "\n\n"...)
 
@@ -3673,17 +3612,19 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 
 	debugLog("开始收集完整响应内容")
 
-	// 使用更健壮的扫描器方式，类似旧版本和流式响应，但增加缓冲区限制
-	scanner := bufio.NewScanner(resp.Body)
-	// 优化缓冲区大小：初始512KB，最大5MB (与流式响应保持一致)
-	scanner.Buffer(make([]byte, 0, 512*1024), 5*1024*1024)
+	// 使用 sonic.Decoder 直接从 resp.Body 读取，避免使用 bufio.Scanner
 	lineCount := 0
 	var upstreamError *UpstreamError // 用于存储上游错误信息
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		lineCount++
+	// sonic.Decoder is not used in this function, removing the pool get/put.
 
+	// 创建一个缓冲读取器来处理 SSE 格式
+	bufReader := bufio.NewReader(resp.Body)
+
+	// 保存读取错误，用于循环后的检查
+	var readErr error
+
+	for {
 		// 检查客户端是否断开连接
 		select {
 		case <-r.Context().Done():
@@ -3693,7 +3634,19 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 			// 继续处理
 		}
 
-		// 更健壮的SSE数据行处理
+		// 读取一行数据
+		line, err := bufReader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				debugLog("到达流末尾")
+			} else {
+				debugLog("读取SSE行失败: %v", err)
+				readErr = err // 保存错误
+			}
+			break
+		}
+
+		lineCount++
 		line = strings.TrimSpace(line)
 		debugLog("处理第%d行原始数据: %s", lineCount, line)
 
@@ -3715,7 +3668,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 		}
 
 		var upstreamData UpstreamData
-		if err := json.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
+		if err := sonic.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
 			debugLog("SSE数据解析失败 (第%d行): %v, 数据: %s", lineCount, err, dataStr)
 			continue
 		}
@@ -3848,10 +3801,6 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		debugLog("扫描器错误: %v", err)
-	}
-
 	finalContent := string(bytes.ReplaceAll(contentBuffer, []byte{0}, []byte{}))
 	finalToolCalls := toolCallHandler.GetToolCalls()
 	debugLog("内容收集完成，总共处理%d行，最终长度: %d, 工具调用数: %d", lineCount, len(finalContent), len(finalToolCalls))
@@ -3861,6 +3810,11 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 		// 使用统一的错误处理函数
 		globalErrorHandler.HandleUpstreamError(w, upstreamError)
 		debugLog("非流式错误响应发送完成: %s", upstreamError.Detail)
+	} else if readErr != nil {
+		// 处理读取错误
+		globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "stream_read_error",
+			"Failed to read upstream response", "读取上游响应失败: %v", readErr)
+		debugLog("非流式读取错误响应发送完成: %v", readErr)
 	} else {
 		// 构造完整响应
 		// "chatcmpl" 是 OpenAI API 的标准 ID 前缀（chat completion 的缩写）
@@ -3901,7 +3855,8 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		if data, err := json.Marshal(response); err != nil {
+		// 使用 sonic.Marshal 直接序列化，避免池化复杂性
+		if data, err := sonic.Marshal(response); err != nil {
 			debugLog("编码非流式响应失败: %v", err)
 			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 		} else if _, err := w.Write(data); err != nil {

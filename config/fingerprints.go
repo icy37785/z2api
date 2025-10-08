@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	json "github.com/bytedance/sonic"
+	"github.com/bytedance/sonic"
 )
 
 // Metadata contains descriptive info about the fingerprints file.
@@ -68,7 +68,7 @@ func LoadFingerprints(path string) error {
 		}
 
 		var data FingerprintsData
-		if unmarshalErr := json.Unmarshal(file, &data); unmarshalErr != nil {
+		if unmarshalErr := sonic.Unmarshal(file, &data); unmarshalErr != nil {
 			err = fmt.Errorf("failed to parse fingerprints JSON: %w", unmarshalErr)
 			return
 		}

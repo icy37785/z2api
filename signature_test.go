@@ -6,14 +6,14 @@ import (
 	"testing"
 	"time"
 
-	json "github.com/bytedance/sonic"
+	"github.com/bytedance/sonic"
 )
 
 // TestDecodeJWT 测试 JWT 解码功能
 func TestDecodeJWT(t *testing.T) {
 	// 创建一个测试用的 JWT payload
 	testPayload := map[string]string{"id": "test-user-123"}
-	payloadBytes, _ := json.Marshal(testPayload)
+	payloadBytes, _ := sonic.Marshal(testPayload)
 	payloadEncoded := base64.URLEncoding.EncodeToString(payloadBytes)
 
 	// 创建一个简化的 JWT token (只有 header.payload.signature 格式)

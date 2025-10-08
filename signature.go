@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	json "github.com/bytedance/sonic"
+	"github.com/bytedance/sonic"
 )
 
 // JWTPayload 表示 JWT token 的 payload 部分
@@ -47,7 +47,7 @@ func decodeJWT(token string) (*JWTPayload, error) {
 
 	// JSON 解析
 	var jwtPayload JWTPayload
-	err = json.Unmarshal(decoded, &jwtPayload)
+	err = sonic.Unmarshal(decoded, &jwtPayload)
 	if err != nil {
 		return nil, fmt.Errorf("JSON 解析失败: %v", err)
 	}
