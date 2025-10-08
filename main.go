@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -25,11 +26,11 @@ import (
 	"time"
 
 	// 添加Brotli支持
-
 	"z2api/config"
 
 	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
+	"golang.org/x/sync/semaphore"
 )
 
 // Config 配置结构体
@@ -175,6 +176,15 @@ var (
 	tokenCache *TokenCache
 )
 
+// 监控指标
+var (
+	totalRequests      = expvar.NewInt("total_requests")
+	currentConcurrency = expvar.NewInt("current_concurrency")
+	requestErrors      = expvar.NewMap("request_errors")
+	tokenCacheHits     = expvar.NewInt("token_cache_hits")
+	tokenCacheMisses   = expvar.NewInt("token_cache_misses")
+)
+
 // RequestStats 请求统计结构
 type RequestStats struct {
 	TotalRequests        int64
@@ -229,10 +239,10 @@ var (
 	httpClient = &http.Client{
 		Timeout: 0,
 		Transport: &http.Transport{
-			MaxIdleConns:          50, // 优化：减少全局空闲连接数
-			MaxIdleConnsPerHost:   10, // 优化：减少单主机空闲连接数（主要对接z.ai）
-			MaxConnsPerHost:       50, // 优化：减少单主机最大连接数
-			IdleConnTimeout:       300 * time.Second,
+			MaxIdleConns:          100,              // 优化：增加全局空闲连接数，减少高并发下建立新连接的开销
+			MaxIdleConnsPerHost:   10,               // 优化：保持单主机空闲连接数
+			MaxConnsPerHost:       50,               // 优化：减少单主机最大连接数
+			IdleConnTimeout:       90 * time.Second, // 优化：缩短空闲连接超时，提高连接回收效率
 			TLSHandshakeTimeout:   10 * time.Second, // TLS握手超时
 			ExpectContinueTimeout: 1 * time.Second,  // Expect: 100-continue超时
 			ResponseHeaderTimeout: 0,                // 响应头超时
@@ -247,6 +257,16 @@ var (
 	detailsCloseRegex = regexp.MustCompile(`(?i)\s*</details\s*>`)
 	// 工具调用相关的正则表达式
 	glmBlockRegex = regexp.MustCompile(`(?s)<glm_block\b[^>]*>(.*?)(?:</glm_block>|$)`)
+
+	// 预编译的键值对提取正则表达式
+	stringPattern = regexp.MustCompile(`"([^"]+)":\s*"([^"]*)"`)
+	numberPattern = regexp.MustCompile(`"([^"]+)":\s*(\d+)`)
+	boolPattern   = regexp.MustCompile(`"([^"]+)":\s*(true|false)`)
+
+	// 预编译的工具调用提取正则表达式
+	idRegex   = regexp.MustCompile(`"id"\s*:\s*"([^"]*)"`)
+	nameRegex = regexp.MustCompile(`"name"\s*:\s*"([^"]*)"`)
+	argsRegex = regexp.MustCompile(`"arguments"\s*:\s*"((?:\\.|[^"])*)"`)
 
 	// 字符串替换器
 	thinkingReplacer = strings.NewReplacer(
@@ -280,10 +300,24 @@ var (
 		},
 	}
 
+	// JSON 解码器对象池
+	jsonDecoderPool = sync.Pool{
+		New: func() interface{} {
+			return json.NewDecoder(strings.NewReader(""))
+		},
+	}
+
+	// SSE 响应缓冲区对象池
+	sseBufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 1024) // 预分配1KB
+		},
+	}
+
 	// 并发控制：限制同时处理的请求数量
 	// 这可以防止在高并发时消耗过多资源
 	// 注意：会在main函数中根据配置重新创建
-	concurrencyLimiter chan struct{}
+	concurrencyLimiter *semaphore.Weighted
 )
 
 // gzipReadCloser 包装gzip.Reader和原始的io.ReadCloser
@@ -645,7 +679,6 @@ func (h *SSEToolCallHandler) extractKeyValuePairs(text string) map[string]interf
 	result := make(map[string]interface{})
 
 	// Match "key": "value" or "key": value patterns
-	stringPattern := regexp.MustCompile(`"([^"]+)":\s*"([^"]*)"`)
 	matches := stringPattern.FindAllStringSubmatch(text, -1)
 	for _, match := range matches {
 		if len(match) >= 3 {
@@ -654,7 +687,6 @@ func (h *SSEToolCallHandler) extractKeyValuePairs(text string) map[string]interf
 	}
 
 	// Match number values
-	numberPattern := regexp.MustCompile(`"([^"]+)":\s*(\d+)`)
 	matches = numberPattern.FindAllStringSubmatch(text, -1)
 	for _, match := range matches {
 		if len(match) >= 3 {
@@ -667,7 +699,6 @@ func (h *SSEToolCallHandler) extractKeyValuePairs(text string) map[string]interf
 	}
 
 	// Match boolean values
-	boolPattern := regexp.MustCompile(`"([^"]+)":\s*(true|false)`)
 	matches = boolPattern.FindAllStringSubmatch(text, -1)
 	for _, match := range matches {
 		if len(match) >= 3 {
@@ -921,9 +952,6 @@ func (h *SSEToolCallHandler) processSingleToolBlock(blockContent string) (ToolCa
 // extractToolDataFromPartialJSON extracts tool information from partial JSON data.
 // 使用增强的JSON解析方法
 func (h *SSEToolCallHandler) extractToolDataFromPartialJSON(blockContent string) (ToolCall, bool) {
-	idRegex := regexp.MustCompile(`"id"\s*:\s*"([^"]*)"`)
-	nameRegex := regexp.MustCompile(`"name"\s*:\s*"([^"]*)"`)
-	argsRegex := regexp.MustCompile(`"arguments"\s*:\s*"((?:\\.|[^"])*)"`)
 
 	var id, name, args string
 	if idMatches := idRegex.FindStringSubmatch(blockContent); len(idMatches) > 1 {
@@ -1575,7 +1603,7 @@ func debugLog(format string, args ...interface{}) {
 	}
 }
 
-// transformThinking 转换思考内容
+// transformThinking 转换思考内容 - 使用对象池优化
 func transformThinking(s string) string {
 	// 去 <summary>…</summary> - 使用预编译的正则表达式
 	s = summaryRegex.ReplaceAllString(s, "")
@@ -2212,6 +2240,7 @@ func (tc *TokenCache) GetToken() (string, error) {
 		token := tc.token
 		tc.mutex.RUnlock()
 		debugLog("使用缓存的匿名token")
+		tokenCacheHits.Add(1)
 		return token, nil
 	}
 	isFetching := tc.fetching
@@ -2288,6 +2317,7 @@ func (tc *TokenCache) GetToken() (string, error) {
 	// 双重检查，可能在等待锁的时候其他goroutine已经获取了
 	if tc.token != "" && time.Now().Before(tc.expiresAt) && !tc.invalidated {
 		debugLog("双重检查：使用缓存的匿名token")
+		tokenCacheHits.Add(1)
 		return tc.token, nil
 	}
 
@@ -2317,8 +2347,10 @@ func (tc *TokenCache) GetToken() (string, error) {
 		tc.token = newToken
 		tc.expiresAt = time.Now().Add(5 * time.Minute) // 5分钟缓存
 		debugLog("获取新的匿名token成功，缓存5分钟")
+		tokenCacheMisses.Add(1)
 	} else {
 		debugLog("获取新的匿名token失败: %v", fetchErr)
+		tokenCacheMisses.Add(1)
 		// 清理可能的过期token
 		if time.Now().After(tc.expiresAt) {
 			tc.token = ""
@@ -2526,7 +2558,7 @@ func main() {
 	statsCollector = NewStatsCollector(1000) // 1000个缓冲区大小
 
 	// 初始化并发控制器
-	concurrencyLimiter = make(chan struct{}, appConfig.MaxConcurrentRequests)
+	concurrencyLimiter = semaphore.NewWeighted(int64(appConfig.MaxConcurrentRequests))
 
 	http.HandleFunc("/v1/models", handleModels)
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
@@ -2759,14 +2791,17 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now() // 记录请求开始时间
 	userAgent := r.Header.Get("User-Agent")
 
+	// 更新监控指标
+	totalRequests.Add(1)
+	currentConcurrency.Add(1)
+	defer currentConcurrency.Add(-1)
+
 	// 改进的并发控制：使用带上下文的超时机制
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second) // 10秒等待超时
 	defer cancel()
 
-	select {
-	case concurrencyLimiter <- struct{}{}:
-		defer func() { <-concurrencyLimiter }()
-	case <-ctx.Done():
+	// 使用 semaphore 进行并发控制
+	if err := concurrencyLimiter.Acquire(ctx, 1); err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 		recordRequestStats(startTime, r.URL.Path, http.StatusServiceUnavailable, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusServiceUnavailable, duration, userAgent, "")
@@ -2774,8 +2809,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		globalErrorHandler.HandleAPIError(w, http.StatusServiceUnavailable, "service_unavailable",
 			"Service temporarily unavailable, please try again later",
 			"服务暂时不可用，并发限制达到上限，等待超时")
+		requestErrors.Add("service_unavailable", 1)
 		return
 	}
+	defer concurrencyLimiter.Release(1)
 
 	setCORSHeaders(w)
 	if r.Method == "OPTIONS" {
@@ -2792,6 +2829,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordRequestStats(startTime, r.URL.Path, http.StatusUnauthorized, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusUnauthorized, duration, userAgent, "")
 		globalErrorHandler.HandleAPIError(w, http.StatusUnauthorized, "invalid_api_key", "Missing or invalid Authorization header", "缺少或无效的Authorization头")
+		requestErrors.Add("invalid_api_key", 1)
 		return
 	}
 
@@ -2801,18 +2839,20 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordRequestStats(startTime, r.URL.Path, http.StatusUnauthorized, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusUnauthorized, duration, userAgent, "")
 		globalErrorHandler.HandleAPIError(w, http.StatusUnauthorized, "invalid_api_key", "Invalid API key", "API密钥验证失败")
+		requestErrors.Add("invalid_api_key", 1)
 		return
 	}
 
 	debugLog("API key验证通过")
 
-	// 解析请求
+	// 解析请求 - 使用对象池优化
 	var req OpenAIRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
 		globalErrorHandler.HandleAPIError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON format", "JSON解析失败: %v", err)
+		requestErrors.Add("invalid_request_error", 1)
 		return
 	}
 
@@ -2824,6 +2864,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
 		globalErrorHandler.HandleAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "输入验证失败: %v", err)
+		requestErrors.Add("invalid_request_error", 1)
 		return
 	}
 
@@ -2851,6 +2892,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// 如果连默认模型都找不到，这是一个严重问题
 			globalErrorHandler.HandleAPIError(w, http.StatusInternalServerError, "model_not_found", "Model not found and no default model configured", "模型 '%s' 未找到且无默认模型", req.Model)
+			requestErrors.Add("model_not_found", 1)
 			return
 		}
 	}
@@ -3542,8 +3584,19 @@ func createSSEChunk(content string, isReasoning bool, model string) OpenAIRespon
 }
 
 func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
+	// 使用对象池优化 SSE 块写入
+	buf := sseBufferPool.Get().([]byte)
+	defer func() {
+		buf = buf[:0] // 重置长度但保留容量
+		sseBufferPool.Put(buf)
+	}()
+
+	buf = append(buf, "data: "...)
 	data, _ := json.Marshal(chunk)
-	fmt.Fprintf(w, "data: %s\n\n", data)
+	buf = append(buf, data...)
+	buf = append(buf, "\n\n"...)
+
+	w.Write(buf)
 }
 
 func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time, sessionID string) {

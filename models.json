@@ -1,4 +1,5 @@
 {
+  "default_model_id": "claude-3-opus-20240229",
   "model_mappings": {
     "glm-4.6": "glm-4.6",
     "glm-4.5v": "glm-4.5v",

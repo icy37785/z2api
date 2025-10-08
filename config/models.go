@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -23,8 +24,9 @@ type ModelConfig struct {
 
 // ModelsData 包含从 models.json 加载的所有数据
 type ModelsData struct {
-	Mappings map[string]string `json:"model_mappings"`
-	Models   []ModelConfig     `json:"models"`
+	DefaultModelID string            `json:"default_model_id"`
+	Mappings       map[string]string `json:"model_mappings"`
+	Models         []ModelConfig     `json:"models"`
 	// 为了快速查找，我们创建一个map
 	modelMap map[string]ModelConfig
 }
@@ -35,12 +37,17 @@ var modelData *ModelsData
 func LoadModels(path string) error {
 	file, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read models file: %w", err)
 	}
 
 	var data ModelsData
 	if err := json.Unmarshal(file, &data); err != nil {
-		return err
+		return fmt.Errorf("failed to parse models JSON: %w", err)
+	}
+
+	// 验证配置是否有效
+	if len(data.Models) == 0 {
+		return fmt.Errorf("no models were loaded")
 	}
 
 	// 将模型列表转换为map以便快速查找
@@ -78,12 +85,22 @@ func GetModelConfig(id string) (ModelConfig, bool) {
 	return config, ok
 }
 
-// GetDefaultModel 获取默认模型 (列表中的第一个)
+// GetDefaultModel 获取默认模型 (根据 default_model_id)
 func GetDefaultModel() (ModelConfig, bool) {
-	if modelData != nil && len(modelData.Models) > 0 {
-		return modelData.Models[0], true
+	if modelData == nil || len(modelData.Models) == 0 {
+		return ModelConfig{}, false
 	}
-	return ModelConfig{}, false
+
+	// 如果设置了 DefaultModelID，使用它来查找模型
+	if modelData.DefaultModelID != "" {
+		normalizedID := strings.ToLower(modelData.DefaultModelID)
+		if config, ok := modelData.modelMap[normalizedID]; ok {
+			return config, true
+		}
+	}
+
+	// 如果找不到指定的默认模型，回退到第一个模型
+	return modelData.Models[0], true
 }
 
 // GetAllModels returns a slice of all loaded model configurations.

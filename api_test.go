@@ -9,6 +9,8 @@ import (
 	"os"
 	"testing"
 	"z2api/config"
+
+	"golang.org/x/sync/semaphore"
 )
 
 func TestMain(m *testing.M) {
@@ -52,7 +54,7 @@ func TestChatCompletions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load config: %v", err)
 	}
-	concurrencyLimiter = make(chan struct{}, appConfig.MaxConcurrentRequests)
+	concurrencyLimiter = semaphore.NewWeighted(int64(appConfig.MaxConcurrentRequests))
 
 	// ... (rest of the test cases are the same)
 	testCases := []struct {
