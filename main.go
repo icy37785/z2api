@@ -2105,6 +2105,31 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
 
+	// 设置默认参数值（如果客户端未提供）
+	if req.Stream == false {
+		// 注意：由于stream是bool类型而不是指针，无法直接判断是否未提供
+		// 但根据OpenAI API规范，如果未提供stream参数，默认为false
+		// 这里不需要修改，保持原值即可
+	}
+
+	if req.Temperature == nil {
+		defaultTemp := 0.7
+		req.Temperature = &defaultTemp
+		debugLog("设置默认temperature: %f", defaultTemp)
+	}
+
+	if req.TopP == nil {
+		defaultTopP := 0.9
+		req.TopP = &defaultTopP
+		debugLog("设置默认top_p: %f", defaultTopP)
+	}
+
+	if req.MaxTokens == nil {
+		defaultMaxTokens := 120000
+		req.MaxTokens = &defaultMaxTokens
+		debugLog("设置默认max_tokens: %d", defaultMaxTokens)
+	}
+
 	// 验证和清理输入数据
 	if err := validateAndSanitizeInput(&req); err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
