@@ -83,8 +83,10 @@ var (
 		},
 	}
 
-	// 标准解码器池 - 已弃用，不再使用
-	// 保留定义以避免破坏其他代码，但不再从池中获取解码器
+/*
+// 标准解码器池 - 已弃用，不再使用
+// 保留定义以避免破坏其他代码，但不再从池中获取解码器
+
 	decoderPool = sync.Pool{
 		New: func() interface{} {
 			// 返回 nil，因为我们不再使用池化的解码器
@@ -93,7 +95,8 @@ var (
 		},
 	}
 
-	// 编码器池 - 直接存储配置，使用时创建编码器
+// 编码器池 - 直接存储配置，使用时创建编码器
+
 	encoderPool = sync.Pool{
 		New: func() interface{} {
 			buf := bytes.NewBuffer(make([]byte, 0, 4096))
@@ -101,7 +104,8 @@ var (
 		},
 	}
 
-	// 快速编码器池 - 用于高性能场景
+// 快速编码器池 - 用于高性能场景
+
 	fastEncoderPool = sync.Pool{
 		New: func() interface{} {
 			buf := bytes.NewBuffer(make([]byte, 0, 4096))
@@ -109,13 +113,15 @@ var (
 		},
 	}
 
-	// 流式编码器池 - 用于SSE响应
+// 流式编码器池 - 用于SSE响应
+
 	streamEncoderPool = sync.Pool{
 		New: func() interface{} {
 			buf := bytes.NewBuffer(make([]byte, 0, 4096))
 			return sonicStream.NewEncoder(buf)
 		},
 	}
+*/
 )
 
 // Config 配置结构体
@@ -339,17 +345,17 @@ var (
 	detailsCloseRegex = regexp.MustCompile(`(?i)\s*</details\s*>`)
 	// 工具调用相关的正则表达式
 	glmBlockRegex = regexp.MustCompile(`(?s)<glm_block\b[^>]*>(.*?)(?:</glm_block>|$)`)
+	/*
+		// 预编译的键值对提取正则表达式
+		stringPattern = regexp.MustCompile(`"([^"]+)":\s*"([^"]*)"`)
+		numberPattern = regexp.MustCompile(`"([^"]+)":\s*(\d+)`)
+		boolPattern   = regexp.MustCompile(`"([^"]+)":\s*(true|false)`)
 
-	// 预编译的键值对提取正则表达式
-	stringPattern = regexp.MustCompile(`"([^"]+)":\s*"([^"]*)"`)
-	numberPattern = regexp.MustCompile(`"([^"]+)":\s*(\d+)`)
-	boolPattern   = regexp.MustCompile(`"([^"]+)":\s*(true|false)`)
-
-	// 预编译的工具调用提取正则表达式
-	idRegex   = regexp.MustCompile(`"id"\s*:\s*"([^"]*)"`)
-	nameRegex = regexp.MustCompile(`"name"\s*:\s*"([^"]*)"`)
-	argsRegex = regexp.MustCompile(`"arguments"\s*:\s*"((?:\\.|[^"])*)"`)
-
+		// 预编译的工具调用提取正则表达式
+		idRegex   = regexp.MustCompile(`"id"\s*:\s*"([^"]*)"`)
+		nameRegex = regexp.MustCompile(`"name"\s*:\s*"([^"]*)"`)
+		argsRegex = regexp.MustCompile(`"arguments"\s*:\s*"((?:\\.|[^"])*)"`)
+	*/
 	// 字符串替换器
 	thinkingReplacer = strings.NewReplacer(
 		"</thinking>", "",
@@ -381,14 +387,14 @@ var (
 			return bytes.NewBuffer(make([]byte, 0, 1024)) // 预分配1KB
 		},
 	}
-
-	// SSE 响应缓冲区对象池
-	sseBufferPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 0, 1024) // 预分配1KB
-		},
-	}
-
+	/*
+		// SSE 响应缓冲区对象池
+		sseBufferPool = sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 0, 1024) // 预分配1KB
+			},
+		}
+	*/
 	// 并发控制：限制同时处理的请求数量
 	// 这可以防止在高并发时消耗过多资源
 	// 注意：会在main函数中根据配置重新创建
@@ -990,7 +996,7 @@ func debugLog(format string, args ...interface{}) {
 	}
 }
 
-// transformThinking 转换思考内容 - 使用对象池优化
+// transformThinking 转换思考内容
 func transformThinking(s string) string {
 	// 去 <summary>…</summary> - 使用预编译的正则表达式
 	s = summaryRegex.ReplaceAllString(s, "")
@@ -998,7 +1004,9 @@ func transformThinking(s string) string {
 	// 根据配置的模式选择合适的替换器和处理策略
 	switch appConfig.ThinkTagsMode {
 	case "think":
+		// 替换 <details> 为 <think>
 		s = detailsRegex.ReplaceAllString(s, "<think>")
+		// 应用替换器（包括 </details> 到 </think> 的替换）
 		s = thinkingReplacer.Replace(s)
 	case "strip":
 		s = detailsRegex.ReplaceAllString(s, "")
@@ -1019,7 +1027,16 @@ func transformThinking(s string) string {
 
 	// 处理起始位置的前缀
 	s = strings.TrimPrefix(s, "> ")
-	return strings.TrimSpace(s)
+	result := strings.TrimSpace(s)
+	
+	// 仅在检测到标签不匹配时记录错误
+	finalThinkOpen := strings.Count(result, "<think>")
+	finalThinkClose := strings.Count(result, "</think>")
+	if finalThinkOpen != finalThinkClose {
+		debugLog("[TRANSFORM_ERROR] 标签不匹配: <think>=%d, </think>=%d", finalThinkOpen, finalThinkClose)
+	}
+	
+	return result
 }
 
 // StatsCollector 异步统计数据收集器
@@ -2833,6 +2850,49 @@ func cleanupResponse(resp *http.Response, cancel context.CancelFunc) {
 	}
 }
 
+// fixUnclosedThinkTags 修复未闭合的 <think> 标签
+// 计算开启和闭合标签的数量差，并在末尾添加缺失的闭合标签
+func fixUnclosedThinkTags(content string) string {
+	if content == "" {
+		return content
+	}
+	
+	// 计算 <think> 和 </think> 标签的数量
+	openCount := strings.Count(content, "<think>")
+	closeCount := strings.Count(content, "</think>")
+	
+	debugLog("[FIX_TAGS] 检测标签数量: <think>=%d, </think>=%d", openCount, closeCount)
+	
+	// 如果开启标签多于闭合标签，添加缺失的闭合标签
+	if openCount > closeCount {
+		missingCount := openCount - closeCount
+		debugLog("[FIX_TAGS] 检测到 %d 个未闭合的<think>标签，自动添加闭合标签", missingCount)
+		
+		// 在内容末尾添加缺失的闭合标签
+		for i := 0; i < missingCount; i++ {
+			content += "</think>"
+		}
+		
+		debugLog("[FIX_TAGS] 已添加 %d 个</think>闭合标签", missingCount)
+		
+		// 验证修复结果
+		newOpenCount := strings.Count(content, "<think>")
+		newCloseCount := strings.Count(content, "</think>")
+		debugLog("[FIX_TAGS] 修复后标签数量: <think>=%d, </think>=%d", newOpenCount, newCloseCount)
+		
+		if newOpenCount != newCloseCount {
+			debugLog("[FIX_TAGS_ERROR] 修复失败，标签仍不平衡")
+		}
+	} else if openCount < closeCount {
+		// 这种情况不太可能发生，但记录日志以便调试
+		debugLog("[FIX_TAGS_WARNING] 闭合标签多于开启标签: <think>=%d, </think>=%d", openCount, closeCount)
+	} else if openCount == closeCount && openCount > 0 {
+		debugLog("[FIX_TAGS] 标签已平衡，无需修复: <think>=%d, </think>=%d", openCount, closeCount)
+	}
+	
+	return content
+}
+
 // writeSSEChunk 写入SSE块到响应流
 // 优化：使用 sonic 流式配置进行高效序列化
 func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
@@ -2843,8 +2903,8 @@ func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
 		return
 	}
 
-	// 写入SSE格式
-	fmt.Fprintf(w, "data: %s\n", string(data))
+	// 写入SSE格式 - 确保有正确的格式
+	fmt.Fprintf(w, "data: %s\n\n", string(data))  // 添加双换行符以符合SSE规范
 }
 
 // handleNonStreamResponseWithIDs 处理非流式响应
@@ -2895,6 +2955,10 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	var errorDetail string
 	var totalSize int64
 	lineCount := 0
+	
+	// 添加标志变量来跟踪是否已经报告过未闭合标签错误
+	var hasReportedUnclosedThinkTag bool
+	var hasReportedUnclosedDetailsTag bool
 
 	// 创建缓冲读取器处理SSE
 	bufReader := bufio.NewReader(resp.Body)
@@ -2959,7 +3023,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 
 		// 处理错误
 		if upstreamData.Error != nil || upstreamData.Data.Error != nil ||
-		   (upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
+			(upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
 			errObj := upstreamData.Error
 			if errObj == nil {
 				errObj = upstreamData.Data.Error
@@ -2971,7 +3035,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 				debugLog("上游错误: code=%d, detail=%s", errObj.Code, errObj.Detail)
 				hasError = true
 				errorDetail = errObj.Detail
-				
+
 				// 检查token问题
 				if strings.Contains(errObj.Detail, "Missing signature header") ||
 					strings.Contains(errObj.Detail, "signature") ||
@@ -2994,9 +3058,39 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 		switch upstreamData.Data.Phase {
 		case "thinking":
 			if upstreamData.Data.DeltaContent != "" {
-				transformed := transformThinking(upstreamData.Data.DeltaContent)
+				rawContent := upstreamData.Data.DeltaContent
+				
+				// 仅在首次检测到未闭合的details标签时报告
+				if !hasReportedUnclosedDetailsTag && (strings.Contains(rawContent, "<details") || strings.Contains(rawContent, "</details>")) {
+					detailsOpenCount := strings.Count(rawContent, "<details")
+					detailsCloseCount := strings.Count(rawContent, "</details>")
+					
+					// 仅在检测到实际的未闭合标签时记录
+					if detailsOpenCount > detailsCloseCount {
+						debugLog("[RAW_SSE] 首次检测到未闭合的details标签 (行 %d): <details=%d, </details>=%d",
+							lineCount, detailsOpenCount, detailsCloseCount)
+						hasReportedUnclosedDetailsTag = true
+					}
+				}
+				
+				// 转换thinking内容
+				transformed := transformThinking(rawContent)
+				
 				if transformed != "" {
 					aggregatedReasoningContent.WriteString(transformed)
+					
+					// 仅在首次检测到未闭合的think标签时报告
+					if !hasReportedUnclosedThinkTag {
+						afterContent := aggregatedReasoningContent.String()
+						afterThinkOpen := strings.Count(afterContent, "<think>")
+						afterThinkClose := strings.Count(afterContent, "</think>")
+						
+						if afterThinkOpen > afterThinkClose {
+							debugLog("[REASONING_ERROR] 首次检测到未闭合的<think>标签: <think>=%d, </think>=%d, 差值=%d",
+								afterThinkOpen, afterThinkClose, afterThinkOpen-afterThinkClose)
+							hasReportedUnclosedThinkTag = true
+						}
+					}
 				}
 			}
 		case "tool_call":
@@ -3030,7 +3124,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 			} else if upstreamData.Data.DeltaContent != "" {
 				aggregatedContent.WriteString(upstreamData.Data.DeltaContent)
 			}
-			
+
 			// 检查是否完成
 			if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
 				debugLog("收到完成信号，结束聚合")
@@ -3087,7 +3181,21 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 
 	// 如果有推理内容，添加到消息中
 	if aggregatedReasoningContent.Len() > 0 {
-		message.ReasoningContent = aggregatedReasoningContent.String()
+		finalReasoningContent := aggregatedReasoningContent.String()
+		
+		// 修复未闭合的 <think> 标签
+		finalReasoningContent = fixUnclosedThinkTags(finalReasoningContent)
+		
+		message.ReasoningContent = finalReasoningContent
+		
+		// 简化日志：仅记录关键信息
+		thinkOpenCount := strings.Count(finalReasoningContent, "<think>")
+		thinkCloseCount := strings.Count(finalReasoningContent, "</think>")
+		if thinkOpenCount > thinkCloseCount {
+			debugLog("[REASONING_ERROR] 修复后仍有未闭合标签: <think>=%d, </think>=%d", thinkOpenCount, thinkCloseCount)
+		} else if thinkOpenCount == thinkCloseCount && thinkOpenCount > 0 {
+			debugLog("[REASONING_FIXED] 标签已修复并平衡: <think>=%d, </think>=%d", thinkOpenCount, thinkCloseCount)
+		}
 	}
 
 	openAIResp.Choices = append(openAIResp.Choices, Choice{
@@ -3114,7 +3222,32 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 		return
 	}
 
-	w.Write(data)
+	// 验证JSON完整性
+	debugLog("生成的JSON响应大小: %d 字节", len(data))
+	if len(data) > 0 && data[len(data)-1] != '}' {
+		debugLog("警告：JSON响应可能不完整，最后字符是: %c", data[len(data)-1])
+	}
+
+	// 替换原来的 w.Write(data)，添加错误处理
+	n, err := w.Write(data)
+	if err != nil {
+		debugLog("写入响应失败: %v, 已写入: %d/%d 字节", err, n, len(data))
+		return
+	}
+	if n != len(data) {
+		debugLog("警告：响应写入不完整 (%d/%d 字节)", n, len(data))
+		// 尝试写入剩余部分
+		remaining := data[n:]
+		if _, err := w.Write(remaining); err != nil {
+			debugLog("写入剩余部分失败: %v", err)
+		}
+	}
+
+	// 确保flush
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+		debugLog("响应已显式flush")
+	}
 
 	// 记录统计
 	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
@@ -3203,6 +3336,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 
 	// 用于跟踪工具调用的状态
 	var toolCalls []ToolCall
+	var inThinkingPhase bool // 跟踪是否处于thinking phase
 
 	// 创建一个缓冲读取器来处理 SSE 格式
 	bufReader := bufio.NewReader(resp.Body)
@@ -3234,6 +3368,17 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			debugLog("读取SSE行失败: %v", err)
 			readErr = err // 保存错误
 			break
+		}
+		
+		// 任务3：在接收原始SSE数据的最早阶段添加日志
+		if strings.HasPrefix(line, "data: ") && strings.Contains(line, "thinking") {
+			// 记录thinking phase的原始数据
+			if strings.Contains(line, "</details") {
+				debugLog("[RAW_SSE_STREAM] 行 %d: 原始数据包含</details标签", lineCount)
+			}
+			if strings.Contains(line, "<details") && !strings.Contains(line, "</details>") {
+				debugLog("[RAW_SSE_STREAM] 警告：行 %d 包含未闭合的<details标签", lineCount)
+			}
 		}
 
 		lineCount++
@@ -3321,6 +3466,26 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			}
 		}
 
+		// 检查是否需要结束 thinking phase
+		if inThinkingPhase && upstreamData.Data.Phase != "thinking" {
+			debugLog("Thinking phase ended (transition to '%s'). Sending closing </think> tag.", upstreamData.Data.Phase)
+			closingChunk := OpenAIResponse{
+				ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   upstreamReq.Model,
+				Choices: []Choice{
+					{
+						Index: 0,
+						Delta: Delta{ReasoningContent: "</think>"},
+					},
+				},
+			}
+			writeSSEChunk(w, closingChunk)
+			flusher.Flush()
+			inThinkingPhase = false // 重置标志
+		}
+
 		// 保存使用量信息
 		if upstreamData.Data.Usage.TotalTokens > 0 {
 			lastUsage = map[string]interface{}{
@@ -3386,6 +3551,9 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 				toolCalls = append(toolCalls, upstreamData.Data.ToolCalls...)
 			}
 		case "thinking":
+			if !inThinkingPhase {
+				inThinkingPhase = true
+			}
 			if upstreamData.Data.DeltaContent != "" {
 				out := transformThinking(upstreamData.Data.DeltaContent)
 				if out != "" {
@@ -3450,6 +3618,25 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	// 检查是否有读取错误
 	if readErr != nil {
 		debugLog("读取SSE流错误: %v", readErr)
+	}
+
+	// 如果流在 thinking phase 结束，确保闭合标签已发送
+	if inThinkingPhase {
+		debugLog("Stream ended during thinking phase. Sending closing </think> tag.")
+		closingChunk := OpenAIResponse{
+			ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   upstreamReq.Model,
+			Choices: []Choice{
+				{
+					Index: 0,
+					Delta: Delta{ReasoningContent: "</think>"},
+				},
+			},
+		}
+		writeSSEChunk(w, closingChunk)
+		flusher.Flush()
 	}
 
 	// 根据是否有工具调用决定结束原因
