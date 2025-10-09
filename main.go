@@ -136,7 +136,6 @@ type Config struct {
 	ThinkTagsMode         string
 	AnonTokenEnabled      bool
 	MaxConcurrentRequests int
-	UseOptimizedHandlers  bool // 是否使用优化版本的处理函数
 }
 
 // TokenCache Token缓存结构体
@@ -186,7 +185,6 @@ func loadConfig() (*Config, error) {
 		ThinkTagsMode:         getEnv("THINK_TAGS_MODE", "think"), // strip, think, raw
 		AnonTokenEnabled:      getEnv("ANON_TOKEN_ENABLED", "true") == "true",
 		MaxConcurrentRequests: maxConcurrent,
-		UseOptimizedHandlers:  getEnv("USE_OPTIMIZED_HANDLERS", "true") == "true", // 默认启用优化版本
 	}
 
 	// 配置验证
@@ -1972,23 +1970,11 @@ func main() {
 	// 初始化并发控制器
 	concurrencyLimiter = semaphore.NewWeighted(int64(appConfig.MaxConcurrentRequests))
 
-	// 注册HTTP处理函数
-	http.HandleFunc("/v1/models", handleModels)
+	// 设置 Gin 路由
+	log.Println("初始化 Gin 路由...")
+	log.Println("使用 Gin 原生处理器")
 
-	// 根据配置选择使用哪个版本的聊天完成处理函数
-	if appConfig.UseOptimizedHandlers {
-		log.Println("使用优化版本的处理函数")
-		http.HandleFunc("/v1/chat/completions", handleChatCompletionsOptimized)
-	} else {
-		log.Println("使用原始版本的处理函数")
-		http.HandleFunc("/v1/chat/completions", handleChatCompletions)
-	}
-
-	http.HandleFunc("/health", handleHealth)                        // 健康检查端点
-	http.HandleFunc("/dashboard", handleDashboard)                  // Dashboard endpoint
-	http.HandleFunc("/dashboard/stats", handleDashboardStats)       // Stats endpoint
-	http.HandleFunc("/dashboard/requests", handleDashboardRequests) // Live requests endpoint
-	http.HandleFunc("/", handleOptions)
+	router := setupRouter()
 
 	// 初始化全局错误处理器
 	globalErrorHandler = NewErrorHandler(appConfig.DebugMode)
@@ -2003,8 +1989,10 @@ func main() {
 	log.Printf("健康检查端点: http://localhost%s/health", appConfig.Port)
 	log.Printf("Dashboard端点: http://localhost%s/dashboard", appConfig.Port)
 
+	// 使用 Gin 的底层 http.Server 配置
 	server := &http.Server{
 		Addr:              appConfig.Port,
+		Handler:           router,
 		ReadTimeout:       300 * time.Second,
 		WriteTimeout:      300 * time.Second, // 增加写超时，适应长流式响应
 		IdleTimeout:       320 * time.Second, // IdleTimeout应该比WriteTimeout稍长
@@ -2237,242 +2225,6 @@ func getModelsList() ModelsResponse {
 	}
 }
 
-// handleChatCompletions 处理聊天完成请求
-// 优化：使用 sonic 对象池进行解码
-func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now() // 记录请求开始时间
-	userAgent := r.Header.Get("User-Agent")
-
-	// 更新监控指标
-	totalRequests.Add(1)
-	currentConcurrency.Add(1)
-	defer currentConcurrency.Add(-1)
-
-	// 改进的并发控制：使用带上下文的超时机制
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second) // 10秒等待超时
-	defer cancel()
-
-	// 使用 semaphore 进行并发控制
-	if err := concurrencyLimiter.Acquire(ctx, 1); err != nil {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusServiceUnavailable, 0, "", false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusServiceUnavailable, duration, userAgent, "")
-		// 使用503状态码表示服务暂时不可用，而不是429
-		globalErrorHandler.HandleAPIError(w, http.StatusServiceUnavailable, "service_unavailable",
-			"Service temporarily unavailable, please try again later",
-			"服务暂时不可用，并发限制达到上限，等待超时")
-		requestErrors.Add("service_unavailable", 1)
-		return
-	}
-	defer concurrencyLimiter.Release(1)
-
-	setCORSHeaders(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	debugLog("收到chat completions请求")
-
-	// 验证API Key
-	authHeader := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusUnauthorized, 0, "", false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusUnauthorized, duration, userAgent, "")
-		globalErrorHandler.HandleAPIError(w, http.StatusUnauthorized, "invalid_api_key", "Missing or invalid Authorization header", "缺少或无效的Authorization头")
-		requestErrors.Add("invalid_api_key", 1)
-		return
-	}
-
-	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
-	if apiKey != appConfig.DefaultKey {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusUnauthorized, 0, "", false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusUnauthorized, duration, userAgent, "")
-		globalErrorHandler.HandleAPIError(w, http.StatusUnauthorized, "invalid_api_key", "Invalid API key", "API密钥验证失败")
-		requestErrors.Add("invalid_api_key", 1)
-		return
-	}
-
-	debugLog("API key验证通过")
-
-	// 解析请求 - 使用 sonic 直接解码
-	var req OpenAIRequest
-
-	// 读取请求体到缓冲区
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
-		globalErrorHandler.HandleAPIError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body", "读取请求体失败: %v", err)
-		requestErrors.Add("invalid_request_error", 1)
-		return
-	}
-
-	// 使用 sonic 直接解码
-	if err := sonicDefault.Unmarshal(bodyBytes, &req); err != nil {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
-		globalErrorHandler.HandleAPIError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON format", "JSON解析失败: %v", err)
-		requestErrors.Add("invalid_request_error", 1)
-		return
-	}
-
-	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
-
-	// 设置默认参数值（如果客户端未提供）
-	if req.Stream == false {
-		// 注意：由于stream是bool类型而不是指针，无法直接判断是否未提供
-		// 但根据OpenAI API规范，如果未提供stream参数，默认为false
-		// 这里不需要修改，保持原值即可
-	}
-
-	if req.Temperature == nil {
-		defaultTemp := 0.7
-		req.Temperature = &defaultTemp
-		debugLog("设置默认temperature: %f", defaultTemp)
-	}
-
-	if req.TopP == nil {
-		defaultTopP := 0.9
-		req.TopP = &defaultTopP
-		debugLog("设置默认top_p: %f", defaultTopP)
-	}
-
-	if req.MaxTokens == nil {
-		defaultMaxTokens := 120000
-		req.MaxTokens = &defaultMaxTokens
-		debugLog("设置默认max_tokens: %d", defaultMaxTokens)
-	}
-
-	// 验证和清理输入数据
-	if err := validateAndSanitizeInput(&req); err != nil {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
-		globalErrorHandler.HandleAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "输入验证失败: %v", err)
-		requestErrors.Add("invalid_request_error", 1)
-		return
-	}
-
-	debugLog("输入验证通过")
-
-	// 为指纹会话生成会话ID
-	var sessionID string
-	if req.User != "" {
-		sessionID = req.User
-	} else {
-		sessionID = getClientIP(r)
-	}
-
-	// 生成会话相关ID - 优化时间戳获取
-	now := time.Now()
-	chatID := fmt.Sprintf("%d-%d", now.UnixNano(), now.Unix())
-	msgID := fmt.Sprintf("%d", now.UnixNano())
-
-	modelConfig, modelFound := config.GetModelConfig(req.Model)
-	if !modelFound {
-		defaultModel, defaultFound := config.GetDefaultModel()
-		if defaultFound {
-			debugLog("警告: 模型 '%s' 在 models.json 中未找到，将使用默认模型 '%s'", req.Model, defaultModel.ID)
-			modelConfig = defaultModel
-		} else {
-			// 如果连默认模型都找不到，这是一个严重问题
-			globalErrorHandler.HandleAPIError(w, http.StatusInternalServerError, "model_not_found", "Model not found and no default model configured", "模型 '%s' 未找到且无默认模型", req.Model)
-			requestErrors.Add("model_not_found", 1)
-			return
-		}
-	}
-
-	isThing := modelConfig.Capabilities.Thinking
-	isSearch := strings.Contains(req.Model, "search") // 保留search模型的特殊判断
-	searchMcp := ""
-	if isSearch {
-		searchMcp = "deep-web-search"
-	}
-
-	modelID := modelConfig.UpstreamID
-	modelName := modelConfig.Name
-
-	// 规范化消息格式（处理多模态内容）
-	normalizedMessages := make([]UpstreamMessage, len(req.Messages))
-	for i, msg := range req.Messages {
-		normalizedMessages[i] = normalizeMultimodalMessage(msg, req.Model)
-	}
-
-	// 解析ToolChoice参数，支持多种格式
-	req.ToolChoiceObject = parseToolChoice(req.ToolChoice)
-
-	// 构造上游请求
-	upstreamReq := UpstreamRequest{
-		Stream:   true, // 总是使用流式从上游获取
-		ChatID:   chatID,
-		ID:       msgID,
-		Model:    modelID, // 上游实际模型ID
-		Messages: normalizedMessages,
-		Params:   buildUpstreamParams(req),
-		Features: map[string]interface{}{
-			"enable_thinking": isThing,
-			"web_search":      isSearch,
-			"auto_web_search": isSearch,
-			"vision":          modelConfig.Capabilities.Vision,
-		},
-		BackgroundTasks: map[string]bool{
-			"title_generation": false,
-			"tags_generation":  false,
-		},
-		MCPServers: func() []string {
-			if searchMcp != "" {
-				return []string{searchMcp}
-			}
-			return []string{}
-		}(),
-		ModelItem: struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			OwnedBy string `json:"owned_by"`
-		}{ID: modelConfig.ID, Name: modelName, OwnedBy: "openai"},
-		ToolServers: []string{},
-		Variables: map[string]string{
-			"{{USER_NAME}}":        "User",
-			"{{USER_LOCATION}}":    "Unknown",
-			"{{CURRENT_DATETIME}}": time.Now().Format("2006-01-02 15:04:05"),
-		},
-		Tools:      req.Tools,      // 传递工具定义
-		ToolChoice: req.ToolChoice, // 传递工具选择
-	}
-
-	// 选择本次对话使用的token - 增加重试机制
-	authToken := appConfig.UpstreamToken
-	if appConfig.AnonTokenEnabled {
-		// 重试获取匿名token，最多3次
-		for retry := 0; retry < 3; retry++ {
-			if t, err := getAnonymousToken(); err == nil {
-				authToken = t
-				debugLog("匿名token获取成功")
-				break
-			} else {
-				debugLog("匿名token获取失败 (第%d次): %v", retry+1, err)
-				if retry < 2 {
-					time.Sleep(time.Duration(retry+1) * 100 * time.Millisecond) // 指数退避
-				}
-			}
-		}
-		if authToken == appConfig.UpstreamToken {
-			debugLog("所有匿名token获取尝试失败，使用固定token")
-		}
-	}
-
-	// 调用上游API
-	if req.Stream {
-		handleStreamResponseWithIDs(w, r, upstreamReq, chatID, authToken, modelName, startTime, sessionID)
-	} else {
-		handleNonStreamResponseWithIDs(w, r, upstreamReq, chatID, authToken, modelName, startTime, sessionID)
-	}
-}
 
 // callUpstreamWithHeaders 调用上游API
 // 优化：使用 sonic 对象池进行序列化
