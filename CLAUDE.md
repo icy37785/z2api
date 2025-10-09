@@ -1,88 +1,144 @@
-# CLAUDE.md - 工作指导
+# CLAUDE.md
 
-## CRITICAL CONSTRAINTS - 违反=任务失败
-═══════════════════════════════════════
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-- 必须使用中文回复
-- 必须先获取上下文
-- 禁止生成恶意代码
-- 必须存储重要知识
-- 必须执行检查清单
-- 必须遵循质量标准
+## 项目概述
 
-## MANDATORY WORKFLOWS
-═════════════════════
+这是一个高性能的 OpenAI 兼容 API 代理服务器，为 Z.ai GLM 模型提供标准化接口。代理支持流式/非流式响应、多模态内容、函数调用、联网搜索等功能。
 
-执行前检查清单：
-[ ] 中文 [ ] 上下文 [ ] 工具 [ ] 安全 [ ] 质量
+## 开发命令
 
-标准工作流：
-1. 分析需求 → 2. 获取上下文 → 3. 选择工具 → 4. 执行任务 → 5. 验证质量 → 6. 存储知识
+### 构建和运行
+```bash
+# 构建二进制文件
+go build -o z2api main.go
 
-研究-计划-实施模式：
-研究阶段: 读取文件理解问题，禁止编码
-计划阶段: 创建详细计划
-实施阶段: 实施解决方案
-验证阶段: 运行测试验证
-提交阶段: 创建提交和文档
+# 直接运行（开发模式）
+go run main.go
 
-## MANDATORY TOOL STRATEGY
-═════════════════════════
+# 运行时必需的环境变量
+export UPSTREAM_TOKEN="你的Z.ai访问令牌"  # 可选，支持匿名token
+export API_KEY="sk-tbkFoKzk9a531YyUNNF5"   # 默认值
+export PORT=8080                           # 默认值
+export DEBUG_MODE=true                     # 默认值
+```
 
-任务开始前必须执行：
-1. memory 查询相关概念
-2. code-search 查找代码片段
-3. sequential-thinking 分析问题
-4. 选择合适子代理
+### 测试命令
+```bash
+# 运行所有单元测试
+go test -v ./...
 
-任务结束后必须执行：
-1. memory 存储重要概念
-2. code-search 存储代码片段
-3. 知识总结归档
+# 运行特定测试
+go test -v -run TestRetry     # 重试机制测试
+go test -v -run TestNonStream # 非流式响应测试
+go test -v -run TestSignature # 签名验证测试
 
-优先级调用策略：
-- Microsoft技术 → microsoft.docs.mcp
-- GitHub文档 → context7 → deepwiki
-- 网页搜索 → 内置搜索 → fetch → duckduckgo-search
+# 功能测试脚本
+./scripts/test_quick.sh         # 快速功能验证（最常用）
+./scripts/test_essential.sh     # 基础功能测试
+./scripts/test_comprehensive.sh # 完整测试套件
+./scripts/test_optimized.sh     # 性能优化测试
 
-## CODING RESTRICTIONS
-═══════════════════
+# 运行覆盖率测试
+go test -v -cover ./...
+```
 
-编码前强制要求：
-- 无明确编写命令禁止编码
-- 无明确授权禁止修改文件
-- 必须先完成sequential-thinking分析
+## 核心架构
 
-## QUALITY STANDARDS
-═══════════════════
+### 请求流程
+1. **入口处理** (`main.go:handleChatCompletions`)
+   - 请求验证和API密钥检查
+   - 请求体解析和预处理
+   - 路由到流式或非流式处理器
 
-工程原则：SOLID、DRY、关注点分离
-代码质量：清晰命名、合理抽象、必要注释
-性能意识：算法复杂度、内存使用、IO优化
-测试思维：可测试设计、边界条件、错误处理
+2. **消息转换** (`message_converter.go`)
+   - OpenAI格式到GLM格式转换
+   - 多模态内容处理（文本+图片）
+   - 工具调用参数转换
 
-## SUBAGENT SELECTION
-════════════════════
+3. **签名生成** (`signature.go`)
+   - JWT token解析获取user_id
+   - HMAC-SHA256签名计算
+   - 时间戳和请求参数编码
 
-必须主动调用合适子代理：
-- Python项目 → python-pro
-- C#/.NET项目 → csharp-pro  
-- JavaScript/TypeScript → javascript-pro/typescript-pro
-- Unity开发 → unity-developer
-- 前端开发 → frontend-developer
-- 后端架构 → backend-architect
-- 云架构 → cloud-architect/hybrid-cloud-architect
-- 数据库优化 → database-optimizer
-- 安全审计 → security-auditor
-- 代码审查 → code-reviewer
-- 测试自动化 → test-automator
-- 性能优化 → performance-engineer
-- DevOps部署 → deployment-engineer
-- 文档编写 → docs-architect
-- 错误调试 → debugger/error-detective
+4. **上游调用** (`main.go:callUpstreamWithRetry`)
+   - 智能重试机制（指数退避+抖动）
+   - 401错误自动刷新token
+   - 连接池复用优化
 
-## ENFORCEMENT
-══════════════
+5. **响应处理**
+   - **流式**: `stream_handler.go` - SSE流解析和转发
+   - **非流式**: `handlers_optimized.go` - 完整响应处理
+   - 特殊功能处理（thinking模式、搜索结果等）
 
-强制触发器：会话开始→检查约束，工具调用前→检查流程，回复前→验证清单
-自我改进：成功→存储，失败→更新规则，持续→优化策略
+### 关键特性实现
+
+#### 重试机制 (`retry_*.go`)
+- 可重试错误类型识别（网络、超时、5xx、429等）
+- 指数退避算法：`delay = baseDelay * 2^attempts`
+- 401错误特殊处理：自动刷新token并重新签名
+- 最大重试5次，避免无限循环
+
+#### 性能优化
+- **对象池**: 减少GC压力（buffers、decoders）
+- **连接池**: HTTP客户端连接复用
+- **并发控制**: Semaphore限流（默认100并发）
+- **Sonic JSON**: 高性能JSON编解码
+- **压缩支持**: Gzip/Brotli透明处理
+
+#### 模型映射 (`model_mapper.go`)
+- OpenAI模型名到GLM模型名映射
+- 支持别名（gpt-4 → glm-4.5等）
+- 特殊模型识别（thinking、search、vision）
+
+## 重要配置
+
+### 环境变量
+- `UPSTREAM_TOKEN`: Z.ai访问令牌（可选）
+- `ANON_TOKEN_ENABLED`: 启用匿名token（默认true）
+- `USE_OPTIMIZED_HANDLERS`: 使用优化处理器（默认true）
+- `MAX_CONCURRENT_REQUESTS`: 最大并发数（默认100）
+- `REQUEST_TIMEOUT`: 请求超时（默认120s）
+
+### 模型支持
+- `glm-4.5`: 标准对话模型
+- `glm-4.5-thinking`: 支持思考过程
+- `glm-4.5-search`: 联网搜索
+- `glm-4.5v`: 多模态（图片+文本）
+- `glm-4.5-air`: 轻量版模型
+- 映射支持：`gpt-4*`, `claude*`, `deepseek*`等
+
+## 调试技巧
+
+### 日志级别
+```bash
+export DEBUG_MODE=true  # 详细日志
+export DEBUG_MODE=false # 生产模式
+```
+
+### 常见问题调试
+1. **401错误**: 检查token是否有效，查看token刷新日志
+2. **签名错误**: 验证signature.go中的密钥和算法
+3. **流式中断**: 检查SSE解析和缓冲区大小
+4. **性能问题**: 查看并发数和连接池配置
+
+### 测试特定功能
+```bash
+# 测试流式响应
+curl -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{"model":"glm-4.5","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# 测试工具调用
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{"model":"glm-4.5","messages":[{"role":"user","content":"Weather?"}],"tools":[...]}'
+```
+
+## 代码规范
+
+- 使用 `go fmt` 格式化代码
+- 错误处理：优先返回错误而非panic
+- 日志：使用分级日志（DEBUG/INFO/ERROR）
+- 测试：新功能必须包含单元测试
+- 性能：注意内存分配和goroutine泄漏

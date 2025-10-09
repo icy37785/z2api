@@ -55,7 +55,7 @@ func TestIsRetryableError(t *testing.T) {
 			statusCode: 0,
 			want:       true,
 		},
-		
+
 		// HTTP状态码测试
 		{
 			name:       "401未授权应该可重试",
@@ -99,7 +99,7 @@ func TestIsRetryableError(t *testing.T) {
 			statusCode: http.StatusRequestTimeout,
 			want:       true,
 		},
-		
+
 		// 特殊的400错误测试
 		{
 			name:         "400系统繁忙应该可重试",
@@ -136,7 +136,7 @@ func TestIsRetryableError(t *testing.T) {
 			responseBody: []byte(`{"error": "service temporarily unavailable"}`),
 			want:         true,
 		},
-		
+
 		// 不可重试的错误
 		{
 			name:         "普通400错误不应该重试",
@@ -223,7 +223,7 @@ func TestCalculateBackoffDelay(t *testing.T) {
 			attempt:     3,
 			baseDelay:   baseDelay,
 			maxDelay:    maxDelay,
-			minExpected: 400 * time.Millisecond, // baseDelay * 8 * 0.5
+			minExpected: 400 * time.Millisecond,  // baseDelay * 8 * 0.5
 			maxExpected: 1200 * time.Millisecond, // baseDelay * 8 * 1.5
 		},
 		{
@@ -241,7 +241,7 @@ func TestCalculateBackoffDelay(t *testing.T) {
 			// 运行多次以测试随机抖动
 			for i := 0; i < 10; i++ {
 				got := calculateBackoffDelay(tt.attempt, tt.baseDelay, tt.maxDelay)
-				
+
 				if got < tt.minExpected {
 					t.Errorf("calculateBackoffDelay(attempt=%d) = %v, 小于最小期望值 %v",
 						tt.attempt, got, tt.minExpected)
@@ -250,13 +250,13 @@ func TestCalculateBackoffDelay(t *testing.T) {
 					t.Errorf("calculateBackoffDelay(attempt=%d) = %v, 大于最大期望值 %v",
 						tt.attempt, got, tt.maxExpected)
 				}
-				
+
 				// 确保不小于基础延迟
 				if got < tt.baseDelay {
 					t.Errorf("calculateBackoffDelay(attempt=%d) = %v, 小于基础延迟 %v",
 						tt.attempt, got, tt.baseDelay)
 				}
-				
+
 				// 确保不大于最大延迟
 				if got > tt.maxDelay {
 					t.Errorf("calculateBackoffDelay(attempt=%d) = %v, 大于最大延迟 %v",
@@ -271,30 +271,30 @@ func TestCalculateBackoffDelay(t *testing.T) {
 func TestCalculateBackoffDelayProgression(t *testing.T) {
 	baseDelay := 100 * time.Millisecond
 	maxDelay := 10 * time.Second
-	
+
 	// 测试延迟是否大致呈指数增长（考虑到随机抖动）
 	var prevAvg time.Duration
-	
+
 	for attempt := 0; attempt <= 5; attempt++ {
 		var total time.Duration
 		runs := 100
-		
+
 		// 运行多次取平均值，以减少随机性的影响
 		for i := 0; i < runs; i++ {
 			delay := calculateBackoffDelay(attempt, baseDelay, maxDelay)
 			total += delay
 		}
-		
+
 		avg := total / time.Duration(runs)
-		
+
 		t.Logf("尝试 %d: 平均延迟 = %v", attempt, avg)
-		
+
 		// 验证平均延迟是否递增（除了第一次）
 		if attempt > 0 && avg <= prevAvg {
 			t.Errorf("延迟没有递增: 尝试 %d 的平均延迟 (%v) <= 尝试 %d 的平均延迟 (%v)",
 				attempt, avg, attempt-1, prevAvg)
 		}
-		
+
 		prevAvg = avg
 	}
 }
@@ -360,7 +360,7 @@ func TestIsRetryableErrorWithNetError(t *testing.T) {
 func BenchmarkIsRetryableError(b *testing.B) {
 	err := errors.New("connection reset")
 	body := []byte(`{"error": "system busy"}`)
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		isRetryableError(err, http.StatusBadRequest, body)
@@ -371,7 +371,7 @@ func BenchmarkIsRetryableError(b *testing.B) {
 func BenchmarkCalculateBackoffDelay(b *testing.B) {
 	baseDelay := 100 * time.Millisecond
 	maxDelay := 10 * time.Second
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		calculateBackoffDelay(3, baseDelay, maxDelay)

@@ -10,8 +10,6 @@ FROM alpine:latest
 RUN apk --no-cache add ca-certificates
 WORKDIR /app
 COPY --from=builder /app/main .
-COPY --from=builder /app/models.json .
-COPY --from=builder /app/fingerprints.json .
-COPY --from=builder /app/dashboard.html .
+COPY --from=builder /app/assets ./assets
 EXPOSE 8080
 CMD ["./main"]

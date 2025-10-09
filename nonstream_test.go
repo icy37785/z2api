@@ -162,7 +162,7 @@ func TestNonStreamResponseAfterFix(t *testing.T) {
 				`data: {"type":"stream","error":{"code":400,"detail":"Bad request"}}`,
 			},
 			expectedStatus: http.StatusInternalServerError, // 期望内部错误
-			validateFunc:   nil,                             // 错误情况不验证响应内容
+			validateFunc:   nil,                            // 错误情况不验证响应内容
 		},
 	}
 
@@ -217,14 +217,14 @@ func TestNonStreamWithTimeout(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
-		
+
 		// 发送初始数据
 		fmt.Fprintln(w, `data: {"type":"stream","data":{"phase":"answer","delta_content":"Starting...","done":false}}`)
 		flusher.Flush()
-		
+
 		// 故意延迟，但不超过context超时
 		time.Sleep(100 * time.Millisecond)
-		
+
 		// 发送剩余数据
 		fmt.Fprintln(w, `data: {"type":"stream","data":{"phase":"answer","delta_content":" Complete!","done":false}}`)
 		flusher.Flush()
@@ -351,8 +351,8 @@ func TestStreamVsNonStreamConsistency(t *testing.T) {
 		appConfig.UpstreamUrl = mockUpstream.URL
 
 		requestBody := OpenAIRequest{
-			Model:  "glm-4.5",
-			Stream: false,
+			Model:    "glm-4.5",
+			Stream:   false,
 			Messages: []Message{{Role: "user", Content: "Test"}},
 		}
 
@@ -380,8 +380,8 @@ func TestStreamVsNonStreamConsistency(t *testing.T) {
 		appConfig.UpstreamUrl = mockUpstream.URL
 
 		requestBody := OpenAIRequest{
-			Model:  "glm-4.5",
-			Stream: true,
+			Model:    "glm-4.5",
+			Stream:   true,
 			Messages: []Message{{Role: "user", Content: "Test"}},
 		}
 
@@ -435,8 +435,8 @@ func setupTestEnvironment(t *testing.T) {
 	}
 
 	// 加载模型配置
-	if err := config.LoadModels("models.json"); err != nil {
-		t.Logf("警告: 无法加载models.json: %v", err)
+	if err := config.LoadModels("assets/models.json"); err != nil {
+		t.Logf("警告: 无法加载assets/models.json: %v", err)
 	}
 
 	// 初始化并发限制器

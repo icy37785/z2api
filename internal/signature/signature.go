@@ -1,4 +1,4 @@
-package main
+package signature
 
 import (
 	"crypto/hmac"
@@ -21,9 +21,9 @@ type SignatureResponse struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-// decodeJWT 解码 JWT token 的 payload 部分
+// DecodeJWT 解码 JWT token 的 payload 部分
 // 参考: docs/参考/signature.py -> decode_jwt_payload
-func decodeJWT(token string) (*JWTPayload, error) {
+func DecodeJWT(token string) (*JWTPayload, error) {
 	// 将 token 按 '.' 分割
 	parts := strings.Split(token, ".")
 	if len(parts) < 3 {
@@ -55,14 +55,14 @@ func decodeJWT(token string) (*JWTPayload, error) {
 	return &jwtPayload, nil
 }
 
-// generateZsSignature 生成 Z.AI API 签名
+// GenerateZsSignature 生成 Z.AI API 签名
 // 参考: docs/参考/signature.py -> zs 和 generate_zs_signature
-func generateZsSignature(userID, requestID string, timestamp int64, userContent string) (*SignatureResponse, error) {
+func GenerateZsSignature(userID, requestID string, timestamp int64, userContent string) (*SignatureResponse, error) {
 	// 直接使用传入的 userID 参数构建签名字符串
 	e := fmt.Sprintf("requestId,%s,timestamp,%d,user_id,%s", requestID, timestamp, userID)
 
 	// 生成签名
-	signature, err := generateSignature(e, userContent, timestamp)
+	signature, err := GenerateSignature(e, userContent, timestamp)
 	if err != nil {
 		return nil, fmt.Errorf("生成签名失败: %v", err)
 	}
@@ -73,18 +73,18 @@ func generateZsSignature(userID, requestID string, timestamp int64, userContent 
 	}, nil
 }
 
-// extractUserID 从 JWT token 中提取 user_id
-func extractUserID(token string) (string, error) {
-	payload, err := decodeJWT(token)
+// ExtractUserID 从 JWT token 中提取 user_id
+func ExtractUserID(token string) (string, error) {
+	payload, err := DecodeJWT(token)
 	if err != nil {
 		return "", err
 	}
 	return payload.ID, nil
 }
 
-// generateSignature 生成 HMAC-SHA256 签名
+// GenerateSignature 生成 HMAC-SHA256 签名
 // 参考: docs/参考/signature.py -> zs 函数
-func generateSignature(e, userContent string, timestamp int64) (string, error) {
+func GenerateSignature(e, userContent string, timestamp int64) (string, error) {
 	// 时间戳字符串
 	r := fmt.Sprintf("%d", timestamp)
 

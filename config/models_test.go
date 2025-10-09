@@ -7,7 +7,7 @@ import (
 
 func TestLoadModels(t *testing.T) {
 	// 测试正常加载
-	if err := LoadModels("../models.json"); err != nil {
+	if err := LoadModels("../assets/models.json"); err != nil {
 		t.Fatalf("加载模型配置失败: %v", err)
 	}
 
@@ -33,7 +33,7 @@ func TestLoadModels(t *testing.T) {
 
 func TestGetDefaultModel(t *testing.T) {
 	// 确保模型已加载
-	if err := LoadModels("../models.json"); err != nil {
+	if err := LoadModels("../assets/models.json"); err != nil {
 		t.Fatalf("加载模型配置失败: %v", err)
 	}
 
@@ -53,7 +53,7 @@ func TestGetDefaultModel(t *testing.T) {
 
 func TestGetModelConfig(t *testing.T) {
 	// 确保模型已加载
-	if err := LoadModels("../models.json"); err != nil {
+	if err := LoadModels("../assets/models.json"); err != nil {
 		t.Fatalf("加载模型配置失败: %v", err)
 	}
 

@@ -41,7 +41,7 @@ func TestChatCompletions(t *testing.T) {
 				t.Logf("警告: 上游请求不是流式的，这在修复后不应该发生")
 			}
 		}
-		
+
 		w.Header().Set("Content-Type", "text/event-stream")
 		// 使用新的上游SSE格式
 		fmt.Fprintln(w, `data: {"type":"stream","data":{"phase":"answer","delta_content":"Hello","done":false}}`)
@@ -55,11 +55,11 @@ func TestChatCompletions(t *testing.T) {
 
 	// Setup
 	os.Setenv("UPSTREAM_URL", mockUpstream.URL)
-	if err := config.LoadModels("models.json"); err != nil {
-		t.Fatalf("failed to load models.json: %v", err)
+	if err := config.LoadModels("assets/models.json"); err != nil {
+		t.Fatalf("failed to load assets/models.json: %v", err)
 	}
-	if err := config.LoadFingerprints("fingerprints.json"); err != nil {
-		t.Logf("warning: failed to load fingerprints.json: %v", err)
+	if err := config.LoadFingerprints("assets/fingerprints.json"); err != nil {
+		t.Logf("warning: failed to load assets/fingerprints.json: %v", err)
 	}
 	var err error
 	appConfig, err = loadConfig()

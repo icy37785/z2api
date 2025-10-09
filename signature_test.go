@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"z2api/internal/signature"
 )
 
 // TestDecodeJWT 测试 JWT 解码功能
@@ -20,7 +21,7 @@ func TestDecodeJWT(t *testing.T) {
 	token := "header." + payloadEncoded + ".signature"
 
 	// 测试解码
-	result, err := decodeJWT(token)
+	result, err := signature.DecodeJWT(token)
 	if err != nil {
 		t.Fatalf("解码 JWT 失败: %v", err)
 	}
@@ -38,38 +39,38 @@ func TestGenerateSignature(t *testing.T) {
 	timestamp := int64(1234567890)
 
 	// 生成签名
-	signature, err := generateSignature(e, userContent, timestamp)
+	sig, err := signature.GenerateSignature(e, userContent, timestamp)
 	if err != nil {
 		t.Fatalf("生成签名失败: %v", err)
 	}
 
 	// 验证签名不为空
-	if signature == "" {
+	if sig == "" {
 		t.Error("生成的签名为空")
 	}
 
 	// 验证签名长度（SHA256 哈希应该是 64 个字符）
-	if len(signature) != 64 {
-		t.Errorf("签名长度应为 64 个字符, 实际为 %d", len(signature))
+	if len(sig) != 64 {
+		t.Errorf("签名长度应为 64 个字符, 实际为 %d", len(sig))
 	}
 
 	// 测试相同输入产生相同签名
-	signature2, err := generateSignature(e, userContent, timestamp)
+	sig2, err := signature.GenerateSignature(e, userContent, timestamp)
 	if err != nil {
 		t.Fatalf("第二次生成签名失败: %v", err)
 	}
 
-	if signature != signature2 {
+	if sig != sig2 {
 		t.Error("相同输入产生了不同的签名")
 	}
 
 	// 测试不同输入产生不同签名
-	signature3, err := generateSignature(e, "different content", timestamp)
+	sig3, err := signature.GenerateSignature(e, "different content", timestamp)
 	if err != nil {
 		t.Fatalf("生成不同内容签名失败: %v", err)
 	}
 
-	if signature == signature3 {
+	if sig == sig3 {
 		t.Error("不同输入产生了相同的签名")
 	}
 }
@@ -83,7 +84,7 @@ func TestGenerateZsSignature(t *testing.T) {
 	userContent := "What's the weather today?"
 
 	// 生成签名
-	result, err := generateZsSignature(userID, requestID, timestamp, userContent)
+	result, err := signature.GenerateZsSignature(userID, requestID, timestamp, userContent)
 	if err != nil {
 		t.Fatalf("生成 ZS 签名失败: %v", err)
 	}
@@ -113,7 +114,7 @@ func TestGenerateZsSignatureWithInvalidToken(t *testing.T) {
 	userContent := "Test content"
 
 	// 生成签名
-	result, err := generateZsSignature(userID, requestID, timestamp, userContent)
+	result, err := signature.GenerateZsSignature(userID, requestID, timestamp, userContent)
 	if err != nil {
 		t.Fatalf("生成签名失败: %v", err)
 	}
@@ -136,7 +137,7 @@ func BenchmarkGenerateSignature(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := generateSignature(e, userContent, timestamp)
+		_, err := signature.GenerateSignature(e, userContent, timestamp)
 		if err != nil {
 			b.Fatalf("生成签名失败: %v", err)
 		}
@@ -146,7 +147,7 @@ func BenchmarkGenerateSignature(b *testing.B) {
 // 示例使用函数
 func Example_generateZsSignature() {
 	// 生成签名
-	result, err := generateZsSignature("example-user", "req-123", time.Now().UnixMilli(), "Hello, world!")
+	result, err := signature.GenerateZsSignature("example-user", "req-123", time.Now().UnixMilli(), "Hello, world!")
 	if err != nil {
 		fmt.Printf("生成签名失败: %v\n", err)
 		return
@@ -166,7 +167,7 @@ func TestSignatureConsistency(t *testing.T) {
 	const ExpectedSignature = "c26d0bc64a0aac997a300425c7fe2235d7c371f28f9aa4f6051c2436f2d2b815"
 
 	// 生成签名
-	result, err := generateZsSignature(TestUserID, TestRequestID, TestTimestamp, TestUserContent)
+	result, err := signature.GenerateZsSignature(TestUserID, TestRequestID, TestTimestamp, TestUserContent)
 	if err != nil {
 		t.Fatalf("生成 ZS 签名失败: %v", err)
 	}

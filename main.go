@@ -29,9 +29,11 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/bytedance/sonic/decoder"
 
-	// 添加Brotli支持
+	// 内部包
 	"z2api/config"
+	"z2api/internal/signature"
 
+	// 第三方包
 	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
 	"golang.org/x/sync/semaphore"
@@ -134,6 +136,7 @@ type Config struct {
 	ThinkTagsMode         string
 	AnonTokenEnabled      bool
 	MaxConcurrentRequests int
+	UseOptimizedHandlers  bool // 是否使用优化版本的处理函数
 }
 
 // TokenCache Token缓存结构体
@@ -183,6 +186,7 @@ func loadConfig() (*Config, error) {
 		ThinkTagsMode:         getEnv("THINK_TAGS_MODE", "think"), // strip, think, raw
 		AnonTokenEnabled:      getEnv("ANON_TOKEN_ENABLED", "true") == "true",
 		MaxConcurrentRequests: maxConcurrent,
+		UseOptimizedHandlers:  getEnv("USE_OPTIMIZED_HANDLERS", "true") == "true", // 默认启用优化版本
 	}
 
 	// 配置验证
@@ -437,16 +441,55 @@ func (br *brotliReadCloser) Close() error {
 
 // ToolCallFunction 工具调用函数结构
 type ToolCallFunction struct {
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
-// ToolCall 工具调用结构
+// ToolCall 工具调用结构 - 符合OpenAI API标准
 type ToolCall struct {
-	Index    int              `json:"index"`
-	ID       string           `json:"id,omitempty"`
-	Type     string           `json:"type,omitempty"`
-	Function ToolCallFunction `json:"function,omitempty"`
+	Index    int              `json:"-"`        // 内部使用，不序列化到JSON
+	ID       string           `json:"id"`       // 必需字段
+	Type     string           `json:"type"`     // 必需字段，通常为"function"
+	Function ToolCallFunction `json:"function"` // 必需字段
+}
+
+// normalizeToolCall 规范化工具调用，确保符合OpenAI API标准
+// 为缺失的必需字段生成默认值
+func normalizeToolCall(tc ToolCall) ToolCall {
+	// 确保有ID，如果没有则生成
+	if tc.ID == "" {
+		tc.ID = fmt.Sprintf("call_%s", uuid.New().String()[:8])
+	}
+
+	// 确保有Type，默认为"function"
+	if tc.Type == "" {
+		tc.Type = "function"
+	}
+
+	// 确保Function.Name不为空（如果为空，说明数据有问题）
+	if tc.Function.Name == "" {
+		debugLog("警告: 工具调用缺少function.name字段")
+	}
+
+	// 确保Arguments至少是空的JSON对象
+	if tc.Function.Arguments == "" {
+		tc.Function.Arguments = "{}"
+	}
+
+	return tc
+}
+
+// normalizeToolCalls 批量规范化工具调用
+func normalizeToolCalls(calls []ToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return calls
+	}
+
+	normalized := make([]ToolCall, len(calls))
+	for i, call := range calls {
+		normalized[i] = normalizeToolCall(call)
+	}
+	return normalized
 }
 
 // ToolFunction 工具函数结构
@@ -1028,14 +1071,14 @@ func transformThinking(s string) string {
 	// 处理起始位置的前缀
 	s = strings.TrimPrefix(s, "> ")
 	result := strings.TrimSpace(s)
-	
+
 	// 仅在检测到标签不匹配时记录错误
 	finalThinkOpen := strings.Count(result, "<think>")
 	finalThinkClose := strings.Count(result, "</think>")
 	if finalThinkOpen != finalThinkClose {
 		debugLog("[TRANSFORM_ERROR] 标签不匹配: <think>=%d, </think>=%d", finalThinkOpen, finalThinkClose)
 	}
-	
+
 	return result
 }
 
@@ -1798,7 +1841,7 @@ func getAnonymousTokenDirect() (string, error) {
 
 // 从文件读取仪表板 HTML
 func loadDashboardHTML() (string, error) {
-	content, err := os.ReadFile("dashboard.html")
+	content, err := os.ReadFile("assets/dashboard.html")
 	if err != nil {
 		return "", err
 	}
@@ -1897,13 +1940,13 @@ func main() {
 	}
 
 	// 加载模型配置
-	if err := config.LoadModels("models.json"); err != nil {
-		log.Fatalf("错误: 无法加载模型配置文件 'models.json': %v", err)
+	if err := config.LoadModels("assets/models.json"); err != nil {
+		log.Fatalf("错误: 无法加载模型配置文件 'assets/models.json': %v", err)
 	}
 
 	// 加载浏览器指纹配置
-	if err := config.LoadFingerprints("fingerprints.json"); err != nil {
-		log.Printf("警告: 无法加载浏览器指纹文件 'fingerprints.json': %v. 将使用默认指纹。", err)
+	if err := config.LoadFingerprints("assets/fingerprints.json"); err != nil {
+		log.Printf("警告: 无法加载浏览器指纹文件 'assets/fingerprints.json': %v. 将使用默认指纹。", err)
 	}
 
 	// 加载和验证配置
@@ -1929,8 +1972,18 @@ func main() {
 	// 初始化并发控制器
 	concurrencyLimiter = semaphore.NewWeighted(int64(appConfig.MaxConcurrentRequests))
 
+	// 注册HTTP处理函数
 	http.HandleFunc("/v1/models", handleModels)
-	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
+
+	// 根据配置选择使用哪个版本的聊天完成处理函数
+	if appConfig.UseOptimizedHandlers {
+		log.Println("使用优化版本的处理函数")
+		http.HandleFunc("/v1/chat/completions", handleChatCompletionsOptimized)
+	} else {
+		log.Println("使用原始版本的处理函数")
+		http.HandleFunc("/v1/chat/completions", handleChatCompletions)
+	}
+
 	http.HandleFunc("/health", handleHealth)                        // 健康检查端点
 	http.HandleFunc("/dashboard", handleDashboard)                  // Dashboard endpoint
 	http.HandleFunc("/dashboard/stats", handleDashboardStats)       // Stats endpoint
@@ -2460,7 +2513,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 
 	// 从 authToken 中解析 user_id
 	var userID string
-	if jwtPayload, err := decodeJWT(authToken); err == nil {
+	if jwtPayload, err := signature.DecodeJWT(authToken); err == nil {
 		userID = jwtPayload.ID
 		debugLog("从 JWT token 中成功解析 user_id: %s", userID)
 	} else {
@@ -2471,7 +2524,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	}
 
 	// 生成签名
-	signature, err := generateZsSignature(userID, requestID, timestamp, userContent)
+	signatureResult, err := signature.GenerateZsSignature(userID, requestID, timestamp, userContent)
 	if err != nil {
 		debugLog("生成签名失败: %v", err)
 		cancel() // 手动取消上下文
@@ -2526,7 +2579,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	}
 
 	// 注入签名头
-	req.Header.Set("X-Signature", signature.Signature)
+	req.Header.Set("X-Signature", signatureResult.Signature)
 
 	// Add additional headers for SSE compatibility
 	req.Header.Set("Content-Type", "application/json")
@@ -2856,30 +2909,30 @@ func fixUnclosedThinkTags(content string) string {
 	if content == "" {
 		return content
 	}
-	
+
 	// 计算 <think> 和 </think> 标签的数量
 	openCount := strings.Count(content, "<think>")
 	closeCount := strings.Count(content, "</think>")
-	
+
 	debugLog("[FIX_TAGS] 检测标签数量: <think>=%d, </think>=%d", openCount, closeCount)
-	
+
 	// 如果开启标签多于闭合标签，添加缺失的闭合标签
 	if openCount > closeCount {
 		missingCount := openCount - closeCount
 		debugLog("[FIX_TAGS] 检测到 %d 个未闭合的<think>标签，自动添加闭合标签", missingCount)
-		
+
 		// 在内容末尾添加缺失的闭合标签
 		for i := 0; i < missingCount; i++ {
 			content += "</think>"
 		}
-		
+
 		debugLog("[FIX_TAGS] 已添加 %d 个</think>闭合标签", missingCount)
-		
+
 		// 验证修复结果
 		newOpenCount := strings.Count(content, "<think>")
 		newCloseCount := strings.Count(content, "</think>")
 		debugLog("[FIX_TAGS] 修复后标签数量: <think>=%d, </think>=%d", newOpenCount, newCloseCount)
-		
+
 		if newOpenCount != newCloseCount {
 			debugLog("[FIX_TAGS_ERROR] 修复失败，标签仍不平衡")
 		}
@@ -2889,7 +2942,7 @@ func fixUnclosedThinkTags(content string) string {
 	} else if openCount == closeCount && openCount > 0 {
 		debugLog("[FIX_TAGS] 标签已平衡，无需修复: <think>=%d, </think>=%d", openCount, closeCount)
 	}
-	
+
 	return content
 }
 
@@ -2904,7 +2957,7 @@ func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
 	}
 
 	// 写入SSE格式 - 确保有正确的格式
-	fmt.Fprintf(w, "data: %s\n\n", string(data))  // 添加双换行符以符合SSE规范
+	fmt.Fprintf(w, "data: %s\n\n", string(data)) // 添加双换行符以符合SSE规范
 }
 
 // handleNonStreamResponseWithIDs 处理非流式响应
@@ -2955,7 +3008,7 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	var errorDetail string
 	var totalSize int64
 	lineCount := 0
-	
+
 	// 添加标志变量来跟踪是否已经报告过未闭合标签错误
 	var hasReportedUnclosedThinkTag bool
 	var hasReportedUnclosedDetailsTag bool
@@ -3059,12 +3112,12 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 		case "thinking":
 			if upstreamData.Data.DeltaContent != "" {
 				rawContent := upstreamData.Data.DeltaContent
-				
+
 				// 仅在首次检测到未闭合的details标签时报告
 				if !hasReportedUnclosedDetailsTag && (strings.Contains(rawContent, "<details") || strings.Contains(rawContent, "</details>")) {
 					detailsOpenCount := strings.Count(rawContent, "<details")
 					detailsCloseCount := strings.Count(rawContent, "</details>")
-					
+
 					// 仅在检测到实际的未闭合标签时记录
 					if detailsOpenCount > detailsCloseCount {
 						debugLog("[RAW_SSE] 首次检测到未闭合的details标签 (行 %d): <details=%d, </details>=%d",
@@ -3072,19 +3125,19 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 						hasReportedUnclosedDetailsTag = true
 					}
 				}
-				
+
 				// 转换thinking内容
 				transformed := transformThinking(rawContent)
-				
+
 				if transformed != "" {
 					aggregatedReasoningContent.WriteString(transformed)
-					
+
 					// 仅在首次检测到未闭合的think标签时报告
 					if !hasReportedUnclosedThinkTag {
 						afterContent := aggregatedReasoningContent.String()
 						afterThinkOpen := strings.Count(afterContent, "<think>")
 						afterThinkClose := strings.Count(afterContent, "</think>")
-						
+
 						if afterThinkOpen > afterThinkClose {
 							debugLog("[REASONING_ERROR] 首次检测到未闭合的<think>标签: <think>=%d, </think>=%d, 差值=%d",
 								afterThinkOpen, afterThinkClose, afterThinkOpen-afterThinkClose)
@@ -3176,18 +3229,18 @@ func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upst
 	message := Message{
 		Role:      "assistant",
 		Content:   aggregatedContent.String(),
-		ToolCalls: aggregatedToolCalls,
+		ToolCalls: normalizeToolCalls(aggregatedToolCalls),
 	}
 
 	// 如果有推理内容，添加到消息中
 	if aggregatedReasoningContent.Len() > 0 {
 		finalReasoningContent := aggregatedReasoningContent.String()
-		
+
 		// 修复未闭合的 <think> 标签
 		finalReasoningContent = fixUnclosedThinkTags(finalReasoningContent)
-		
+
 		message.ReasoningContent = finalReasoningContent
-		
+
 		// 简化日志：仅记录关键信息
 		thinkOpenCount := strings.Count(finalReasoningContent, "<think>")
 		thinkCloseCount := strings.Count(finalReasoningContent, "</think>")
@@ -3369,7 +3422,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			readErr = err // 保存错误
 			break
 		}
-		
+
 		// 任务3：在接收原始SSE数据的最早阶段添加日志
 		if strings.HasPrefix(line, "data: ") && strings.Contains(line, "thinking") {
 			// 记录thinking phase的原始数据
@@ -3529,6 +3582,9 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		case "tool_call":
 			// 处理工具调用
 			if len(upstreamData.Data.ToolCalls) > 0 {
+				// 规范化工具调用
+				normalizedCalls := normalizeToolCalls(upstreamData.Data.ToolCalls)
+
 				chunk := OpenAIResponse{
 					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 					Object:  "chat.completion.chunk",
@@ -3539,7 +3595,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 							Index: 0,
 							Delta: Delta{
 								Role:      "assistant",
-								ToolCalls: upstreamData.Data.ToolCalls,
+								ToolCalls: normalizedCalls,
 							},
 						},
 					},
@@ -3548,7 +3604,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 				flusher.Flush()
 
 				// 保存工具调用状态
-				toolCalls = append(toolCalls, upstreamData.Data.ToolCalls...)
+				toolCalls = append(toolCalls, normalizedCalls...)
 			}
 		case "thinking":
 			if !inThinkingPhase {
