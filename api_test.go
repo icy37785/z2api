@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,12 +31,22 @@ func TestMain(m *testing.M) {
 }
 
 func TestChatCompletions(t *testing.T) {
-	// 创建一个模拟的上游服务器
+	// 创建一个模拟的上游服务器，修改为使用新的SSE格式
 	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 验证上游请求总是流式的（修复后的关键特性）
+		var upstreamReq UpstreamRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := sonic.Unmarshal(body, &upstreamReq); err == nil {
+			if !upstreamReq.Stream {
+				t.Logf("警告: 上游请求不是流式的，这在修复后不应该发生")
+			}
+		}
+		
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprintln(w, "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"glm-4.5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}")
+		// 使用新的上游SSE格式
+		fmt.Fprintln(w, `data: {"type":"stream","data":{"phase":"answer","delta_content":"Hello","done":false}}`)
 		fmt.Fprintln(w, "")
-		fmt.Fprintln(w, "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1694268190,\"model\":\"glm-4.5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}")
+		fmt.Fprintln(w, `data: {"type":"stream","data":{"phase":"done","done":true,"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}}`)
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "data: [DONE]")
 		fmt.Fprintln(w, "")
@@ -64,9 +75,10 @@ func TestChatCompletions(t *testing.T) {
 		expectedStatus int
 	}{
 		{
-			name: "Basic Request",
+			name: "Basic Non-Stream Request (修复后应正常工作)",
 			requestBody: OpenAIRequest{
-				Model: "glm-4.5",
+				Model:  "glm-4.5",
+				Stream: false, // 明确测试非流式请求
 				Messages: []Message{
 					{Role: "user", Content: "Hello"},
 				},

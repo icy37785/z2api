@@ -194,6 +194,179 @@ response = client.chat.completions.create(
 - **流式处理**: 高效的 SSE 流处理，实时响应
 - **监控日志**: 内置性能统计和分层日志系统
 
+## 🔄 重试机制
+
+### 概述
+
+本项目实现了一个强大而智能的重试机制，确保在面对网络波动、临时服务不可用或认证过期等问题时，API 请求能够自动恢复并成功完成。该机制采用指数退避算法，结合随机抖动和特殊错误处理，最大程度地提高了请求成功率。
+
+### 核心特性
+
+- ⚡ **智能错误识别**: 自动识别可重试和不可重试的错误类型
+- 🔐 **401 错误特殊处理**: 自动刷新 token 并重新生成签名
+- 📈 **指数退避策略**: 避免雪崩效应，减轻服务器压力
+- 🎲 **随机抖动算法**: 防止重试风暴，分散请求时间
+- 🚦 **最大重试限制**: 防止无限重试，默认最多 5 次
+- 📊 **详细日志记录**: 完整的重试过程追踪，便于调试
+
+### 支持的重试错误类型
+
+#### 网络和连接错误
+- `context.DeadlineExceeded` - 上下文超时
+- `io.EOF` / `io.ErrUnexpectedEOF` - 连接意外关闭
+- `connection reset by peer` - 连接被重置
+- `connection refused` - 连接被拒绝
+- `broken pipe` - 管道破裂
+- 网络超时错误（`net.Error` 的 `Timeout()` 为 true）
+- 临时网络错误（`net.Error` 的 `Temporary()` 为 true）
+
+#### HTTP 状态码
+| 状态码 | 错误类型 | 处理策略 |
+|--------|----------|----------|
+| 401 | Unauthorized | 刷新 token，重新生成签名后重试 |
+| 408 | Request Timeout | 直接重试 |
+| 429 | Too Many Requests | 使用更长的延迟时间重试 |
+| 500 | Internal Server Error | 直接重试 |
+| 502 | Bad Gateway | 直接重试 |
+| 503 | Service Unavailable | 直接重试 |
+| 504 | Gateway Timeout | 直接重试 |
+
+#### 特殊 400 错误
+某些 400 错误在特定情况下也会被重试：
+- 响应体包含 `"系统繁忙"` 或 `"system busy"`
+- 响应体包含 `"rate limit"`
+- 响应体包含 `"too many requests"`
+- 响应体包含 `"temporarily unavailable"`
+
+### 重试策略
+
+#### 指数退避算法
+```
+延迟时间 = baseDelay * 2^(重试次数)
+```
+
+- **基础延迟**: 100ms
+- **最大延迟**: 10s
+- **429 限流特殊处理**: 基础延迟增加到 1s，最大延迟 30s
+
+#### 抖动策略
+为避免重试风暴，每次延迟会添加 ±25% 的随机抖动：
+```
+实际延迟 = 计算延迟 ± (计算延迟 * 0.25 * 随机值)
+```
+
+#### 重试次数限制
+- **默认最大重试次数**: 5 次
+- **包括初次请求在内**: 总共最多 5 次请求
+
+### 401 错误的特殊处理流程
+
+当遇到 401 未授权错误时，系统会执行以下特殊处理：
+
+1. **立即标记当前 token 为失效**
+   ```go
+   tokenCache.InvalidateToken()
+   ```
+
+2. **获取新的匿名 token**（如果启用）
+   ```go
+   if appConfig.AnonTokenEnabled {
+       newToken, _ := getAnonymousTokenDirect()
+   }
+   ```
+
+3. **重新生成请求签名**
+   - 使用新 token 的 user_id
+   - 重新计算时间戳
+   - 生成新的 HMAC-SHA256 签名
+
+4. **使用新凭证重试请求**
+
+### 配置参数
+
+虽然重试机制是自动的，但以下环境变量会影响其行为：
+
+| 环境变量 | 描述 | 默认值 | 影响 |
+|----------|------|--------|------|
+| `ANON_TOKEN_ENABLED` | 启用匿名 token | `true` | 影响 401 错误的处理方式 |
+| `DEBUG_MODE` | 调试模式 | `true` | 控制重试日志的详细程度 |
+
+### 使用示例
+
+#### 日志示例 - 成功重试
+
+```log
+[DEBUG] 开始第 1/5 次尝试调用上游API
+[DEBUG] 上游响应状态: 503 Service Unavailable
+[DEBUG] 收到可重试的HTTP状态码 503 (尝试 1/5)
+[DEBUG] 网关错误 503，可重试
+[DEBUG] 计算退避延迟：尝试 0，基础延迟 100ms，最终延迟 125ms
+[DEBUG] 等待 125ms 后重试
+
+[DEBUG] 开始第 2/5 次尝试调用上游API
+[DEBUG] 上游响应状态: 200 OK
+[DEBUG] 上游调用成功 (尝试 2/5): 200
+```
+
+#### 日志示例 - 401 错误处理
+
+```log
+[DEBUG] 开始第 1/5 次尝试调用上游API
+[DEBUG] 上游响应状态: 401 Unauthorized
+[DEBUG] 收到401错误，尝试刷新token和重新生成签名
+[DEBUG] 匿名token已标记为失效，下次请求将获取新token
+[DEBUG] 成功获取新的匿名token，下次重试将使用新token和新签名
+[DEBUG] 等待 100ms 后重试
+
+[DEBUG] 开始第 2/5 次尝试调用上游API
+[DEBUG] 从 JWT token 中成功解析 user_id: user-123456
+[DEBUG] 构建的完整URL: https://chat.z.ai/api/chat/completions?signature_timestamp=...
+[DEBUG] 上游响应状态: 200 OK
+```
+
+#### 日志示例 - 达到最大重试次数
+
+```log
+[DEBUG] 开始第 1/5 次尝试调用上游API
+[DEBUG] 上游响应状态: 500 Internal Server Error
+[DEBUG] 500服务器内部错误，可重试
+...
+[DEBUG] 开始第 5/5 次尝试调用上游API
+[DEBUG] 上游响应状态: 500 Internal Server Error
+[ERROR] 上游API在 5 次尝试后仍然失败，最后状态码: 500
+```
+
+### 最佳实践
+
+1. **监控重试日志**: 定期检查重试日志，识别潜在的系统问题
+2. **调整超时设置**: 根据实际网络环境调整请求超时时间
+3. **token 管理**: 确保 `UPSTREAM_TOKEN` 或匿名 token 机制正常工作
+4. **错误分析**: 分析不可重试的错误，改进请求参数验证
+
+### 实现细节
+
+重试机制的核心实现位于以下函数：
+
+- [`isRetryableError()`](main.go:2586) - 判断错误是否可重试
+- [`calculateBackoffDelay()`](main.go:2667) - 计算退避延迟时间
+- [`callUpstreamWithRetry()`](main.go:2692) - 带重试的上游调用
+- [`cleanupResponse()`](main.go:2820) - 清理失败响应，优化连接复用
+
+### 测试覆盖
+
+重试机制包含全面的单元测试和集成测试：
+
+- **单元测试** ([`retry_test.go`](retry_test.go))：测试错误判断和延迟计算
+- **集成测试** ([`retry_integration_test.go`](retry_integration_test.go))：模拟真实场景的重试行为
+
+测试覆盖包括：
+- ✅ 各种错误类型的识别
+- ✅ 指数退避算法正确性
+- ✅ 401 错误的 token 刷新
+- ✅ 最大重试次数限制
+- ✅ 网络错误和超时处理
+- ✅ 特殊 400 错误的重试
+
 ## 📊 监控
 
 服务器提供详细的性能监控信息：

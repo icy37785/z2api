@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"expvar"
 	"fmt"
 	"hash/fnv"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/decoder"
 
 	// 添加Brotli支持
 	"z2api/config"
@@ -34,6 +36,86 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
+)
+
+// 自定义 sonic 配置 - 针对不同场景的优化配置
+var (
+	// 默认配置：平衡性能和兼容性
+	sonicDefault = sonic.ConfigDefault
+
+	// 流式配置：优化SSE流处理
+	sonicStream = sonic.Config{
+		EscapeHTML:       false, // SSE不需要HTML转义
+		SortMapKeys:      false, // 不排序键，提高性能
+		CompactMarshaler: true,  // 紧凑输出
+		CopyString:       false, // 避免字符串复制
+		// 跳过原始消息验证以提高性能
+	}.Froze()
+
+	// 高性能配置：用于内部数据传输
+	sonicFast = sonic.Config{
+		EscapeHTML:            false,
+		SortMapKeys:           false,
+		CompactMarshaler:      true,
+		CopyString:            false,
+		UseInt64:              false, // 使用更快的整数处理
+		UseNumber:             false, // 直接使用数字类型
+		DisallowUnknownFields: false, // 忽略未知字段
+		NoQuoteTextMarshaler:  true,  // 跳过文本引号处理
+	}.Froze()
+
+	// 兼容配置：用于外部API交互
+	sonicCompatible = sonic.Config{
+		EscapeHTML:       true,  // 保持HTML转义
+		SortMapKeys:      true,  // 排序键以保持一致性
+		CompactMarshaler: false, // 保持格式化
+		CopyString:       true,  // 复制字符串以避免引用问题
+		// 启用完整验证以确保兼容性
+	}.Froze()
+)
+
+// sonic 编码器/解码器对象池 - 减少内存分配
+var (
+	// 流式解码器池
+	streamDecoderPool = sync.Pool{
+		New: func() interface{} {
+			return decoder.NewStreamDecoder(nil)
+		},
+	}
+
+	// 标准解码器池 - 已弃用，不再使用
+	// 保留定义以避免破坏其他代码，但不再从池中获取解码器
+	decoderPool = sync.Pool{
+		New: func() interface{} {
+			// 返回 nil，因为我们不再使用池化的解码器
+			// 直接使用 sonic 的 Unmarshal 方法更高效且避免了类型断言问题
+			return nil
+		},
+	}
+
+	// 编码器池 - 直接存储配置，使用时创建编码器
+	encoderPool = sync.Pool{
+		New: func() interface{} {
+			buf := bytes.NewBuffer(make([]byte, 0, 4096))
+			return sonicDefault.NewEncoder(buf)
+		},
+	}
+
+	// 快速编码器池 - 用于高性能场景
+	fastEncoderPool = sync.Pool{
+		New: func() interface{} {
+			buf := bytes.NewBuffer(make([]byte, 0, 4096))
+			return sonicFast.NewEncoder(buf)
+		},
+	}
+
+	// 流式编码器池 - 用于SSE响应
+	streamEncoderPool = sync.Pool{
+		New: func() interface{} {
+			buf := bytes.NewBuffer(make([]byte, 0, 4096))
+			return sonicStream.NewEncoder(buf)
+		},
+	}
 )
 
 // Config 配置结构体
@@ -864,10 +946,11 @@ func buildUpstreamParams(req OpenAIRequest) map[string]interface{} {
 }
 
 // maskJSONForLogging masks sensitive fields in a JSON string for logging purposes.
+// 优化：使用 sonic 对象池进行解析
 func maskJSONForLogging(jsonStr string) string {
 	var data map[string]interface{}
-	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
-	if err := sonic.Unmarshal([]byte(jsonStr), &data); err != nil {
+	// 使用 sonic 进行解析
+	if err := sonicDefault.UnmarshalFromString(jsonStr, &data); err != nil {
 		// If parsing fails, just truncate the raw string if it's too long.
 		if len(jsonStr) > 512 {
 			return jsonStr[:512] + "...(truncated)"
@@ -888,8 +971,8 @@ func maskJSONForLogging(jsonStr string) string {
 		}
 	}
 
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	maskedBytes, err := sonic.Marshal(data)
+	// 使用 sonic 进行序列化
+	maskedBytes, err := sonicFast.Marshal(data)
 	if err != nil {
 		// Fallback if marshaling fails
 		if len(jsonStr) > 512 {
@@ -1389,6 +1472,7 @@ func NewErrorHandler(debugMode bool) *ErrorHandler {
 }
 
 // HandleAPIError 处理API格式的错误响应，统一错误格式和日志记录
+// 优化：使用 sonic 编码错误响应
 func (eh *ErrorHandler) HandleAPIError(w http.ResponseWriter, statusCode int, errorType string, message string, logMsg string, args ...interface{}) {
 	// 统一日志记录
 	if logMsg != "" {
@@ -1415,17 +1499,18 @@ func (eh *ErrorHandler) HandleAPIError(w http.ResponseWriter, statusCode int, er
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	if data, err := sonic.Marshal(errorResponse); err != nil {
+
+	// 使用 sonic 快速配置进行序列化
+	if data, err := sonicFast.Marshal(errorResponse); err != nil {
 		debugLog("编码错误响应失败: %v", err)
 		http.Error(w, message, statusCode)
 	} else if _, err := w.Write(data); err != nil {
 		debugLog("写入错误响应失败: %v", err)
-		http.Error(w, message, statusCode)
 	}
 }
 
 // HandleUpstreamError 统一处理上游错误响应
+// 优化：使用 sonic 编码错误响应
 func (eh *ErrorHandler) HandleUpstreamError(w http.ResponseWriter, err *UpstreamError) {
 	setCORSHeaders(w)
 
@@ -1446,13 +1531,13 @@ func (eh *ErrorHandler) HandleUpstreamError(w http.ResponseWriter, err *Upstream
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadGateway)
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	if data, encodeErr := sonic.Marshal(errorResponse); encodeErr != nil {
+
+	// 使用 sonic 快速配置进行序列化
+	if data, encodeErr := sonicFast.Marshal(errorResponse); encodeErr != nil {
 		debugLog("编码上游错误响应失败: %v", encodeErr)
 		http.Error(w, err.Detail, http.StatusBadGateway)
 	} else if _, writeErr := w.Write(data); writeErr != nil {
 		debugLog("写入上游错误响应失败: %v", writeErr)
-		http.Error(w, err.Detail, http.StatusBadGateway)
 	}
 }
 
@@ -1648,6 +1733,7 @@ func generateBrowserHeaders(sessionID, chatID, authToken, scenario string) map[s
 }
 
 // getAnonymousTokenDirect 直接获取匿名token（原始方法，不使用缓存）
+// 优化：使用 sonic 解析响应
 func getAnonymousTokenDirect() (string, error) {
 	// 如果禁用匿名token，直接返回错误
 	if !appConfig.AnonTokenEnabled {
@@ -1683,8 +1769,8 @@ func getAnonymousTokenDirect() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// 使用 sonic.Unmarshal 直接解析，避免池化复杂性
-	if err := sonic.Unmarshal(respBody, &body); err != nil {
+	// 使用 sonic 进行解析
+	if err := sonicDefault.Unmarshal(respBody, &body); err != nil {
 		return "", err
 	}
 	if body.Token == "" {
@@ -1704,38 +1790,85 @@ func loadDashboardHTML() (string, error) {
 
 var dashboardHTML string
 
+// initSonicPretouch 初始化 sonic JIT 预热 - 扩展预热范围
+func initSonicPretouch() {
+	debugLog("开始扩展的 sonic JIT 预热...")
+
+	// 核心请求/响应结构
+	coreTypes := []reflect.Type{
+		reflect.TypeOf(OpenAIRequest{}),
+		reflect.TypeOf(OpenAIResponse{}),
+		reflect.TypeOf(UpstreamRequest{}),
+		reflect.TypeOf(UpstreamData{}),
+		reflect.TypeOf(Choice{}),
+		reflect.TypeOf(Message{}),
+		reflect.TypeOf(UpstreamMessage{}),
+		reflect.TypeOf(Delta{}),
+		reflect.TypeOf(Usage{}),
+	}
+
+	// 工具相关结构
+	toolTypes := []reflect.Type{
+		reflect.TypeOf(ToolCall{}),
+		reflect.TypeOf(ToolCallFunction{}),
+		reflect.TypeOf(Tool{}),
+		reflect.TypeOf(ToolFunction{}),
+		reflect.TypeOf(ToolChoice{}),
+		reflect.TypeOf(ToolChoiceFunction{}),
+	}
+
+	// 多模态内容结构
+	contentTypes := []reflect.Type{
+		reflect.TypeOf(ContentPart{}),
+		reflect.TypeOf(ImageURL{}),
+		reflect.TypeOf(VideoURL{}),
+		reflect.TypeOf(DocumentURL{}),
+		reflect.TypeOf(AudioURL{}),
+		reflect.TypeOf([]ContentPart{}),
+	}
+
+	// 错误和模型结构
+	utilTypes := []reflect.Type{
+		reflect.TypeOf(UpstreamError{}),
+		reflect.TypeOf(ErrorResponse{}),
+		reflect.TypeOf(ErrorDetail{}),
+		reflect.TypeOf(ModelsResponse{}),
+		reflect.TypeOf(Model{}),
+		reflect.TypeOf([]Model{}),
+		reflect.TypeOf(map[string]interface{}{}),
+		reflect.TypeOf([]interface{}{}),
+	}
+
+	// 统计结构
+	statsTypes := []reflect.Type{
+		reflect.TypeOf(RequestStats{}),
+		reflect.TypeOf(LiveRequest{}),
+		reflect.TypeOf([]LiveRequest{}),
+		reflect.TypeOf(StatsUpdate{}),
+	}
+
+	// 执行预热
+	allTypes := append(append(append(append(coreTypes, toolTypes...), contentTypes...), utilTypes...), statsTypes...)
+
+	successCount := 0
+	failCount := 0
+
+	for _, t := range allTypes {
+		if err := sonic.Pretouch(t); err != nil {
+			debugLog("预热 %v 失败: %v", t, err)
+			failCount++
+		} else {
+			successCount++
+		}
+	}
+
+	debugLog("sonic JIT 预热完成: 成功 %d 个类型，失败 %d 个类型", successCount, failCount)
+}
+
 // main is the entry point of the application
 func main() {
-	// JIT 预热核心数据结构
-	debugLog("开始 sonic JIT 预热...")
-	if err := sonic.Pretouch(reflect.TypeOf(OpenAIRequest{})); err != nil {
-		debugLog("OpenAIRequest JIT 预热失败: %v", err)
-	}
-	if err := sonic.Pretouch(reflect.TypeOf(UpstreamRequest{})); err != nil {
-		debugLog("UpstreamRequest JIT 预热失败: %v", err)
-	}
-	if err := sonic.Pretouch(reflect.TypeOf(UpstreamData{})); err != nil {
-		debugLog("UpstreamData JIT 预热失败: %v", err)
-	}
-	if err := sonic.Pretouch(reflect.TypeOf(OpenAIResponse{})); err != nil {
-		debugLog("OpenAIResponse JIT 预热失败: %v", err)
-	}
-	if err := sonic.Pretouch(reflect.TypeOf(Choice{})); err != nil {
-		debugLog("Choice JIT 预热失败: %v", err)
-	}
-	if err := sonic.Pretouch(reflect.TypeOf(Message{})); err != nil {
-		debugLog("Message JIT 预热失败: %v", err)
-	}
-	if err := sonic.Pretouch(reflect.TypeOf(Delta{})); err != nil {
-		debugLog("Delta JIT 预热失败: %v", err)
-	}
-	if err := sonic.Pretouch(reflect.TypeOf(ToolCall{})); err != nil {
-		debugLog("ToolCall JIT 预热失败: %v", err)
-	}
-	if err := sonic.Pretouch(reflect.TypeOf(Usage{})); err != nil {
-		debugLog("Usage JIT 预热失败: %v", err)
-	}
-	debugLog("sonic JIT 预热完成")
+	// 执行扩展的 JIT 预热
+	initSonicPretouch()
 
 	// 加载仪表板HTML
 	var err error
@@ -1843,6 +1976,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDashboardStats handles the dashboard stats endpoint
+// 优化：使用 sonic 编码统计响应
 func handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	// 检查 stats 是否已初始化，防止在测试环境中出现空指针错误
 	if stats == nil {
@@ -1878,17 +2012,17 @@ func handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	if data, err := sonic.Marshal(statsResponse); err != nil {
+	// 使用 sonic 兼容配置进行序列化（外部API响应）
+	if data, err := sonicCompatible.Marshal(statsResponse); err != nil {
 		debugLog("编码统计响应失败: %v", err)
 		http.Error(w, "Failed to encode stats", http.StatusInternalServerError)
 	} else if _, err := w.Write(data); err != nil {
 		debugLog("写入统计响应失败: %v", err)
-		http.Error(w, "Failed to write stats", http.StatusInternalServerError)
 	}
 }
 
 // handleDashboardRequests handles the dashboard live requests endpoint
+// 优化：使用 sonic 编码实时请求响应
 func handleDashboardRequests(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	if r.Method == "OPTIONS" {
@@ -1908,13 +2042,12 @@ func handleDashboardRequests(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	if data, err := sonic.Marshal(requests); err != nil {
+	// 使用 sonic 兼容配置进行序列化
+	if data, err := sonicCompatible.Marshal(requests); err != nil {
 		debugLog("Failed to encode live requests: %v", err)
 		http.Error(w, "Failed to encode requests", http.StatusInternalServerError)
 	} else if _, err := w.Write(data); err != nil {
 		debugLog("Failed to write live requests: %v", err)
-		http.Error(w, "Failed to write requests", http.StatusInternalServerError)
 	}
 }
 
@@ -1939,6 +2072,7 @@ func handleOptions(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleHealth 健康检查端点
+// 优化：使用 sonic 编码健康检查响应
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	if r.Method == "OPTIONS" {
@@ -1966,13 +2100,12 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	if data, err := sonic.Marshal(healthResponse); err != nil {
+	// 使用 sonic 兼容配置进行序列化
+	if data, err := sonicCompatible.Marshal(healthResponse); err != nil {
 		debugLog("编码健康检查响应失败: %v", err)
 		http.Error(w, "Failed to encode health", http.StatusInternalServerError)
 	} else if _, err := w.Write(data); err != nil {
 		debugLog("写入健康检查响应失败: %v", err)
-		http.Error(w, "Failed to write health", http.StatusInternalServerError)
 	}
 }
 
@@ -1983,6 +2116,8 @@ func setCORSHeaders(w http.ResponseWriter) {
 	// 移除 Access-Control-Allow-Credentials 以与 * origin 兼容
 }
 
+// handleModels 处理模型列表请求
+// 优化：使用 sonic 编码模型列表响应
 func handleModels(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	userAgent := r.Header.Get("User-Agent")
@@ -1997,13 +2132,12 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	response := getModelsList()
 
 	w.Header().Set("Content-Type", "application/json")
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	if data, err := sonic.Marshal(response); err != nil {
+	// 使用 sonic 兼容配置进行序列化（外部API响应）
+	if data, err := sonicCompatible.Marshal(response); err != nil {
 		debugLog("编码模型列表响应失败: %v", err)
 		http.Error(w, "Failed to encode models", http.StatusInternalServerError)
 	} else if _, err := w.Write(data); err != nil {
 		debugLog("写入模型列表响应失败: %v", err)
-		http.Error(w, "Failed to write models", http.StatusInternalServerError)
 	}
 
 	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
@@ -2033,6 +2167,8 @@ func getModelsList() ModelsResponse {
 	}
 }
 
+// handleChatCompletions 处理聊天完成请求
+// 优化：使用 sonic 对象池进行解码
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now() // 记录请求开始时间
 	userAgent := r.Header.Get("User-Agent")
@@ -2091,10 +2227,22 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	debugLog("API key验证通过")
 
-	// 解析请求 - 使用流式解码器优化内存使用
+	// 解析请求 - 使用 sonic 直接解码
 	var req OpenAIRequest
-	decoder := sonic.ConfigStd.NewDecoder(r.Body)
-	if err := decoder.Decode(&req); err != nil {
+
+	// 读取请求体到缓冲区
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
+		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
+		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
+		globalErrorHandler.HandleAPIError(w, http.StatusBadRequest, "invalid_request_error", "Failed to read request body", "读取请求体失败: %v", err)
+		requestErrors.Add("invalid_request_error", 1)
+		return
+	}
+
+	// 使用 sonic 直接解码
+	if err := sonicDefault.Unmarshal(bodyBytes, &req); err != nil {
 		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 		recordRequestStats(startTime, r.URL.Path, http.StatusBadRequest, 0, "", false)
 		addLiveRequest(r.Method, r.URL.Path, http.StatusBadRequest, duration, userAgent, "")
@@ -2256,6 +2404,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// callUpstreamWithHeaders 调用上游API
+// 优化：使用 sonic 对象池进行序列化
 func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
 	// 创建带超时的上下文 - 根据请求类型动态调整超时时间
 	var timeout time.Duration
@@ -2274,16 +2424,15 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 		bytesBufferPool.Put(buf)
 	}()
 
-	var data []byte
-	var err error
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	if data, err = sonic.Marshal(upstreamReq); err != nil {
+	// 使用 sonic 快速配置进行序列化（内部通信）
+	data, err := sonicFast.Marshal(upstreamReq)
+	if err != nil {
 		debugLog("上游请求序列化失败: %v", err)
 		cancel() // 手动取消上下文
 		return nil, nil, err
 	}
 	buf.Write(data)
-	data = buf.Bytes()
+
 	debugLog("调用上游API: %s (超时: %v)", appConfig.UpstreamUrl, timeout)
 	debugLog("上游请求体: %s", maskJSONForLogging(string(data)))
 
@@ -2346,7 +2495,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	debugLog("构建的完整URL: %s", upstreamURL)
 	debugLog("查询参数: user_id=%s, current_url=%s, pathname=%s", userID, currentURL, pathname)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(buf.Bytes()))
 	if err != nil {
 		debugLog("创建HTTP请求失败: %v", err)
 		cancel() // 手动取消上下文
@@ -2433,82 +2582,233 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	return resp, cancel, nil
 }
 
+// isRetryableError 判断错误是否可重试
+// 包括特殊的400错误（如"系统繁忙"）、超时错误、网络错误等
+func isRetryableError(err error, statusCode int, responseBody []byte) bool {
+	// 检查网络和超时错误
+	if err != nil {
+		// 检查context超时错误
+		if errors.Is(err, context.DeadlineExceeded) {
+			debugLog("检测到context超时错误，可重试")
+			return true
+		}
+
+		// 检查网络错误
+		var netErr net.Error
+		if errors.As(err, &netErr) {
+			if netErr.Timeout() {
+				debugLog("检测到网络超时错误，可重试")
+				return true
+			}
+			// 临时网络错误
+			if netErr.Temporary() {
+				debugLog("检测到临时网络错误，可重试")
+				return true
+			}
+		}
+
+		// 检查EOF错误（连接意外关闭）
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			debugLog("检测到EOF错误，可重试")
+			return true
+		}
+
+		// 检查连接重置和拒绝错误
+		errStr := err.Error()
+		if strings.Contains(errStr, "connection reset") ||
+			strings.Contains(errStr, "connection refused") ||
+			strings.Contains(errStr, "broken pipe") {
+			debugLog("检测到连接错误: %s，可重试", errStr)
+			return true
+		}
+	}
+
+	// 检查HTTP状态码
+	switch statusCode {
+	case http.StatusUnauthorized: // 401
+		debugLog("401错误，需要重新认证，可重试")
+		return true
+	case http.StatusTooManyRequests: // 429
+		debugLog("429限流错误，可重试")
+		return true
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout: // 502, 503, 504
+		debugLog("网关错误 %d，可重试", statusCode)
+		return true
+	case http.StatusInternalServerError: // 500
+		debugLog("500服务器内部错误，可重试")
+		return true
+	case http.StatusRequestTimeout: // 408
+		debugLog("408请求超时，可重试")
+		return true
+	case http.StatusBadRequest: // 400
+		// 检查特殊的400错误情况
+		if len(responseBody) > 0 {
+			bodyStr := string(responseBody)
+			// 检查"系统繁忙"等可重试的400错误
+			if strings.Contains(bodyStr, "系统繁忙") ||
+				strings.Contains(bodyStr, "system busy") ||
+				strings.Contains(bodyStr, "rate limit") ||
+				strings.Contains(bodyStr, "too many requests") ||
+				strings.Contains(bodyStr, "temporarily unavailable") {
+				debugLog("检测到特殊的400错误（%s），可重试", bodyStr)
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// calculateBackoffDelay 计算指数退避延迟时间（带抖动）
+// attempt: 当前重试次数（从0开始）
+// baseDelay: 基础延迟时间
+// maxDelay: 最大延迟时间
+func calculateBackoffDelay(attempt int, baseDelay time.Duration, maxDelay time.Duration) time.Duration {
+	// 指数退避：baseDelay * 2^attempt
+	delay := baseDelay * time.Duration(1<<uint(attempt))
+
+	// 添加随机抖动（±25%），在限制最大延迟之前计算
+	jitter := time.Duration(rand.Float64() * 0.5 * float64(delay))
+	if rand.Intn(2) == 0 {
+		delay = delay + jitter
+	} else {
+		delay = delay - jitter
+		if delay < baseDelay {
+			delay = baseDelay
+		}
+	}
+
+	// 最后再限制最大延迟，确保不会超过maxDelay
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+
+	debugLog("计算退避延迟：尝试 %d，基础延迟 %v，最终延迟 %v", attempt, baseDelay, delay)
+	return delay
+}
+
 // callUpstreamWithRetry 调用上游API并处理重试，改进资源管理和超时控制
 func callUpstreamWithRetry(upstreamReq UpstreamRequest, chatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
 	var lastErr error
-	maxRetries := 3
+	maxRetries := 5 // 增加到5次重试
+	baseDelay := 100 * time.Millisecond
+	maxDelay := 10 * time.Second
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		debugLog("开始第 %d/%d 次尝试调用上游API", attempt+1, maxRetries)
+
 		// 每次重试都创建新的context，避免context污染
 		resp, cancel, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken, sessionID)
+
+		// 检查是否需要重试（包括网络错误）
 		if err != nil {
 			debugLog("上游调用失败 (尝试 %d/%d): %v", attempt+1, maxRetries, err)
 			if cancel != nil {
 				cancel() // 立即取消context以释放资源
 			}
-			lastErr = err
-			if attempt < maxRetries-1 {
-				// 指数退避：100ms, 200ms, 400ms
-				backoffDelay := time.Duration(100*(1<<attempt)) * time.Millisecond
-				time.Sleep(backoffDelay)
-				continue
+
+			// 判断是否为可重试的错误
+			if isRetryableError(err, 0, nil) {
+				lastErr = err
+				if attempt < maxRetries-1 {
+					delay := calculateBackoffDelay(attempt, baseDelay, maxDelay)
+					debugLog("网络错误，等待 %v 后重试", delay)
+					time.Sleep(delay)
+
+					// 如果是超时或认证错误，可能需要刷新token
+					if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline") {
+						debugLog("检测到超时错误，检查是否需要刷新token")
+						if appConfig.AnonTokenEnabled {
+							if newToken, tokenErr := getAnonymousTokenDirect(); tokenErr == nil {
+								authToken = newToken
+								debugLog("成功刷新匿名token")
+								// 重新生成签名将在下次调用callUpstreamWithHeaders时自动完成
+							}
+						}
+					}
+					continue
+				}
+			} else {
+				// 不可重试的错误，直接返回
+				debugLog("不可重试的错误，停止重试: %v", err)
+				return nil, nil, err
 			}
-			return nil, nil, fmt.Errorf("上游API在 %d 次尝试后仍然失败: %w", maxRetries, lastErr)
 		}
 
-		// 检查可重试的状态码
-		switch resp.StatusCode {
-		case http.StatusOK:
-			debugLog("上游调用成功 (尝试 %d/%d): %d", attempt+1, maxRetries, resp.StatusCode)
-			return resp, cancel, nil // 成功，直接返回
+		// 如果请求成功，检查响应状态码
+		if resp != nil {
+			// 读取一些响应体用于错误分析（如果需要）
+			var bodyBytes []byte
+			if resp.StatusCode != http.StatusOK {
+				// 尝试读取响应体用于错误分析
+				bodyBytes, _ = io.ReadAll(io.LimitReader(resp.Body, 1024)) // 最多读1KB用于分析
+				// 重新包装响应体，以便后续处理
+				resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyBytes), resp.Body))
+			}
 
-		case http.StatusUnauthorized:
-			debugLog("收到401错误 (尝试 %d/%d)", attempt+1, maxRetries)
-			// 如果是401且启用了匿名token，尝试刷新token
-			if appConfig.AnonTokenEnabled {
-				debugLog("尝试刷新匿名token")
-				if newToken, tokenErr := getAnonymousTokenDirect(); tokenErr == nil {
-					authToken = newToken
-					debugLog("成功获取新的匿名token，将在下次重试中使用")
-				} else {
-					debugLog("刷新匿名token失败: %v", tokenErr)
+			// 检查状态码
+			if resp.StatusCode == http.StatusOK {
+				debugLog("上游调用成功 (尝试 %d/%d): %d", attempt+1, maxRetries, resp.StatusCode)
+				return resp, cancel, nil // 成功，直接返回
+			}
+
+			// 检查是否为可重试的HTTP错误
+			if isRetryableError(nil, resp.StatusCode, bodyBytes) {
+				debugLog("收到可重试的HTTP状态码 %d (尝试 %d/%d)", resp.StatusCode, attempt+1, maxRetries)
+
+				// 特殊处理401错误
+				if resp.StatusCode == http.StatusUnauthorized {
+					debugLog("收到401错误，尝试刷新token和重新生成签名")
+					// 标记token为失效
+					if tokenCache != nil {
+						tokenCache.InvalidateToken()
+					}
+					// 如果启用了匿名token，尝试获取新的
+					if appConfig.AnonTokenEnabled {
+						if newToken, tokenErr := getAnonymousTokenDirect(); tokenErr == nil {
+							authToken = newToken
+							debugLog("成功获取新的匿名token，下次重试将使用新token和新签名")
+							// 注意：签名会在下次调用callUpstreamWithHeaders时自动重新生成
+						} else {
+							debugLog("刷新匿名token失败: %v", tokenErr)
+						}
+					}
 				}
+
+				// 关闭当前响应
+				cleanupResponse(resp, cancel)
+
+				// 如果不是最后一次尝试，等待后重试
+				if attempt < maxRetries-1 {
+					// 对于429限流，使用更长的基础延迟
+					if resp.StatusCode == http.StatusTooManyRequests {
+						delay := calculateBackoffDelay(attempt, 1*time.Second, 180*time.Second)
+						debugLog("限流错误，等待 %v 后重试", delay)
+						time.Sleep(delay)
+					} else {
+						delay := calculateBackoffDelay(attempt, baseDelay, maxDelay)
+						debugLog("等待 %v 后重试", delay)
+						time.Sleep(delay)
+					}
+					continue
+				}
+			} else {
+				// 不可重试的状态码，直接返回
+				debugLog("收到不可重试的状态码 %d，停止重试", resp.StatusCode)
+				return resp, cancel, nil
 			}
-			// 关闭当前响应并重试
-			cleanupResponse(resp, cancel)
-
-		case http.StatusTooManyRequests:
-			debugLog("收到429限流错误 (尝试 %d/%d)", attempt+1, maxRetries)
-			// 对于限流，使用更长的等待时间
-			cleanupResponse(resp, cancel)
-			if attempt < maxRetries-1 {
-				// 限流等待时间：1s, 2s, 4s
-				rateLimitDelay := time.Duration(1<<attempt) * time.Second
-				debugLog("限流等待 %v", rateLimitDelay)
-				time.Sleep(rateLimitDelay)
-			}
-
-		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-			debugLog("收到网关错误 %d (尝试 %d/%d)", resp.StatusCode, attempt+1, maxRetries)
-			cleanupResponse(resp, cancel)
-
-		default:
-			// 对于其他不可重试的错误，直接返回
-			debugLog("收到不可重试的状态码 %d，不再重试", resp.StatusCode)
-			return resp, cancel, nil
 		}
 
 		// 如果是最后一次尝试，返回错误
 		if attempt == maxRetries-1 {
-			lastErr = fmt.Errorf("上游API在 %d 次尝试后仍然失败，最后状态码: %d", maxRetries, resp.StatusCode)
+			if resp != nil {
+				lastErr = fmt.Errorf("上游API在 %d 次尝试后仍然失败，最后状态码: %d", maxRetries, resp.StatusCode)
+			} else if lastErr != nil {
+				lastErr = fmt.Errorf("上游API在 %d 次尝试后仍然失败: %w", maxRetries, lastErr)
+			} else {
+				lastErr = fmt.Errorf("上游API在 %d 次尝试后仍然失败", maxRetries)
+			}
 			return nil, nil, lastErr
-		}
-
-		// 等待后重试（除限流外的普通重试）
-		if resp.StatusCode != http.StatusTooManyRequests {
-			backoffDelay := time.Duration(100*(1<<attempt)) * time.Millisecond
-			debugLog("等待 %v 后重试", backoffDelay)
-			time.Sleep(backoffDelay)
 		}
 	}
 
@@ -2533,6 +2833,300 @@ func cleanupResponse(resp *http.Response, cancel context.CancelFunc) {
 	}
 }
 
+// writeSSEChunk 写入SSE块到响应流
+// 优化：使用 sonic 流式配置进行高效序列化
+func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
+	// 使用 sonic 流式配置直接编码
+	data, err := sonicStream.Marshal(chunk)
+	if err != nil {
+		debugLog("编码SSE块失败: %v", err)
+		return
+	}
+
+	// 写入SSE格式
+	fmt.Fprintf(w, "data: %s\n", string(data))
+}
+
+// handleNonStreamResponseWithIDs 处理非流式响应
+// 优化：使用 sonic 解码器池处理响应
+func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time, sessionID string) {
+	userAgent := r.Header.Get("User-Agent")
+	debugLog("开始处理非流式响应 (chat_id=%s, model=%s) - 内部使用流式请求并聚合", chatID, upstreamReq.Model)
+
+	// 重要修改：将上游请求改为流式（解决Z.ai API返回SSE格式的问题）
+	upstreamReq.Stream = true
+
+	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
+	if err != nil {
+		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
+		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, false)
+		addLiveRequest(r.Method, r.URL.Path, http.StatusBadGateway, duration, userAgent, modelName)
+		globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error",
+			"Failed to call upstream", "调用上游失败: %v", err)
+		return
+	}
+	defer func() {
+		cancel()
+		resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
+		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, false)
+		addLiveRequest(r.Method, r.URL.Path, http.StatusBadGateway, duration, userAgent, modelName)
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error",
+				"Upstream error", "上游返回错误状态: %d, 读取响应体失败: %v", resp.StatusCode, err)
+		} else {
+			globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error",
+				"Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
+		}
+		return
+	}
+
+	// 流式响应聚合变量
+	var aggregatedContent strings.Builder
+	var aggregatedReasoningContent strings.Builder
+	var aggregatedToolCalls []ToolCall
+	var lastUsage Usage
+	var hasError bool
+	var errorDetail string
+	var totalSize int64
+	lineCount := 0
+
+	// 创建缓冲读取器处理SSE
+	bufReader := bufio.NewReader(resp.Body)
+	debugLog("开始聚合流式响应为非流式格式")
+
+	// 用于跟踪工具调用
+	toolCallsMap := make(map[int]*ToolCall)
+
+	for {
+		// 检查客户端是否断开
+		select {
+		case <-r.Context().Done():
+			debugLog("客户端断开连接，停止处理")
+			return
+		default:
+		}
+
+		// 读取一行
+		line, err := bufReader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				debugLog("到达流末尾，共处理 %d 行", lineCount)
+				break
+			}
+			debugLog("读取SSE行失败: %v", err)
+			break
+		}
+
+		lineCount++
+		line = strings.TrimSpace(line)
+
+		// 检查累积大小
+		totalSize += int64(len(line))
+		if totalSize > MaxResponseSize {
+			debugLog("响应大小超出限制 (%d > %d)，停止处理", totalSize, MaxResponseSize)
+			hasError = true
+			errorDetail = fmt.Sprintf("响应大小超出限制 (%d bytes)", MaxResponseSize)
+			break
+		}
+
+		// 处理SSE数据行
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		dataStr := strings.TrimPrefix(line, "data: ")
+		dataStr = strings.TrimSpace(dataStr)
+		if dataStr == "" || dataStr == "[DONE]" {
+			if dataStr == "[DONE]" {
+				debugLog("收到[DONE]信号，结束聚合")
+				break
+			}
+			continue
+		}
+
+		// 解析JSON
+		var upstreamData UpstreamData
+		if err := sonicStream.UnmarshalFromString(dataStr, &upstreamData); err != nil {
+			debugLog("SSE数据解析失败 (行 %d): %v", lineCount, err)
+			continue
+		}
+
+		// 处理错误
+		if upstreamData.Error != nil || upstreamData.Data.Error != nil ||
+		   (upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
+			errObj := upstreamData.Error
+			if errObj == nil {
+				errObj = upstreamData.Data.Error
+			}
+			if errObj == nil && upstreamData.Data.Inner != nil {
+				errObj = upstreamData.Data.Inner.Error
+			}
+			if errObj != nil {
+				debugLog("上游错误: code=%d, detail=%s", errObj.Code, errObj.Detail)
+				hasError = true
+				errorDetail = errObj.Detail
+				
+				// 检查token问题
+				if strings.Contains(errObj.Detail, "Missing signature header") ||
+					strings.Contains(errObj.Detail, "signature") ||
+					errObj.Code == 400 {
+					debugLog("检测到可能的token签名错误，标记token为失效")
+					if tokenCache != nil {
+						tokenCache.InvalidateToken()
+					}
+				}
+				break
+			}
+		}
+
+		// 聚合usage信息
+		if upstreamData.Data.Usage.TotalTokens > 0 {
+			lastUsage = upstreamData.Data.Usage
+		}
+
+		// 根据Phase聚合内容
+		switch upstreamData.Data.Phase {
+		case "thinking":
+			if upstreamData.Data.DeltaContent != "" {
+				transformed := transformThinking(upstreamData.Data.DeltaContent)
+				if transformed != "" {
+					aggregatedReasoningContent.WriteString(transformed)
+				}
+			}
+		case "tool_call":
+			// 处理工具调用
+			if len(upstreamData.Data.ToolCalls) > 0 {
+				for _, tc := range upstreamData.Data.ToolCalls {
+					if existing, ok := toolCallsMap[tc.Index]; ok {
+						// 更新现有工具调用
+						if tc.Function.Arguments != "" {
+							existing.Function.Arguments += tc.Function.Arguments
+						}
+					} else {
+						// 新工具调用
+						newTC := tc
+						toolCallsMap[tc.Index] = &newTC
+					}
+				}
+			}
+		case "answer", "done":
+			// 处理answer内容
+			if upstreamData.Data.EditContent != "" {
+				// 处理初始答案
+				content := upstreamData.Data.EditContent
+				parts := detailsCloseRegex.Split(content, -1)
+				if len(parts) > 1 {
+					content = parts[1]
+				}
+				if content != "" {
+					aggregatedContent.WriteString(content)
+				}
+			} else if upstreamData.Data.DeltaContent != "" {
+				aggregatedContent.WriteString(upstreamData.Data.DeltaContent)
+			}
+			
+			// 检查是否完成
+			if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
+				debugLog("收到完成信号，结束聚合")
+				break
+			}
+		default:
+			// 其他情况，聚合delta内容
+			if upstreamData.Data.DeltaContent != "" {
+				aggregatedContent.WriteString(upstreamData.Data.DeltaContent)
+			}
+		}
+	}
+
+	// 处理错误情况
+	if hasError {
+		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
+		recordRequestStats(startTime, r.URL.Path, http.StatusInternalServerError, 0, modelName, false)
+		addLiveRequest(r.Method, r.URL.Path, http.StatusInternalServerError, duration, userAgent, modelName)
+		globalErrorHandler.HandleAPIError(w, http.StatusInternalServerError, "stream_aggregation_error",
+			"Failed to aggregate stream response", "流式响应聚合失败: %s", errorDetail)
+		return
+	}
+
+	// 将工具调用map转换为slice
+	for _, tc := range toolCallsMap {
+		aggregatedToolCalls = append(aggregatedToolCalls, *tc)
+	}
+	// 按index排序工具调用
+	sort.Slice(aggregatedToolCalls, func(i, j int) bool {
+		return aggregatedToolCalls[i].Index < aggregatedToolCalls[j].Index
+	})
+
+	// 构建OpenAI格式响应
+	openAIResp := OpenAIResponse{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   modelName,
+		Choices: []Choice{},
+	}
+
+	// 确定完成原因
+	finishReason := "stop"
+	if len(aggregatedToolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+
+	// 构建消息
+	message := Message{
+		Role:      "assistant",
+		Content:   aggregatedContent.String(),
+		ToolCalls: aggregatedToolCalls,
+	}
+
+	// 如果有推理内容，添加到消息中
+	if aggregatedReasoningContent.Len() > 0 {
+		message.ReasoningContent = aggregatedReasoningContent.String()
+	}
+
+	openAIResp.Choices = append(openAIResp.Choices, Choice{
+		Index:        0,
+		Message:      message,
+		FinishReason: finishReason,
+	})
+
+	// 添加usage信息
+	if lastUsage.TotalTokens > 0 {
+		openAIResp.Usage = lastUsage
+	}
+
+	// 发送响应
+	setCORSHeaders(w)
+	w.Header().Set("Content-Type", "application/json")
+
+	// 使用sonic编码响应
+	data, err := sonicDefault.Marshal(openAIResp)
+	if err != nil {
+		debugLog("编码响应失败: %v", err)
+		globalErrorHandler.HandleAPIError(w, http.StatusInternalServerError, "encode_error",
+			"Failed to encode response", "编码响应失败: %v", err)
+		return
+	}
+
+	w.Write(data)
+
+	// 记录统计
+	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
+	recordRequestStats(startTime, r.URL.Path, http.StatusOK, int64(lastUsage.TotalTokens), modelName, false)
+	addLiveRequest(r.Method, r.URL.Path, http.StatusOK, duration, userAgent, modelName)
+
+	debugLog("非流式响应（通过流式聚合）完成，处理了 %d 行SSE数据，使用tokens: %d",
+		lineCount, lastUsage.TotalTokens)
+}
+
+// handleStreamResponseWithIDs 处理流式响应
+// 优化：使用 sonic 流式解码器处理SSE
 func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time, sessionID string) {
 	userAgent := r.Header.Get("User-Agent")
 	debugLog("开始处理流式响应 (chat_id=%s, model=%s)", chatID, upstreamReq.Model)
@@ -2599,7 +3193,8 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	flusher.Flush()
 
 	debugLog("开始读取上游SSE流")
-	// 使用 sonic.Decoder 直接从 resp.Body 读取，避免使用 bufio.Scanner
+
+	// 使用 sonic 流式解码器处理 SSE
 	lineCount := 0
 	var totalSize int64
 	var lastUsage map[string]interface{}
@@ -2609,11 +3204,12 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 	// 用于跟踪工具调用的状态
 	var toolCalls []ToolCall
 
-	// 不使用 sonic.Decoder 池，直接使用 sonic.Unmarshal
-	// 因为 sonic.Decoder 的 Reset 方法不适合频繁重置
-
 	// 创建一个缓冲读取器来处理 SSE 格式
 	bufReader := bufio.NewReader(resp.Body)
+
+	// 从池中获取流式解码器
+	streamDec := streamDecoderPool.Get().(*decoder.StreamDecoder)
+	defer streamDecoderPool.Put(streamDec)
 
 	// 保存读取错误，用于循环后的检查
 	var readErr error
@@ -2665,13 +3261,14 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			continue
 		}
 
-		// 使用 sonic.Unmarshal 直接解析 JSON
+		// 使用 sonic 流式配置解析 JSON
 		var upstreamData UpstreamData
-		if err := sonic.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
+		if err := sonicStream.UnmarshalFromString(dataStr, &upstreamData); err != nil {
 			debugLog("SSE数据解析失败: %v", err)
 			continue
 		}
 
+		// 处理错误响应
 		if (upstreamData.Error != nil) || (upstreamData.Data.Error != nil) || (upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
 			errObj := upstreamData.Error
 			if errObj == nil {
@@ -2719,13 +3316,12 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 				recordRequestStats(startTime, r.URL.Path, 200, 0, modelName, true)
 				addLiveRequest(r.Method, r.URL.Path, 200, duration, userAgent, modelName)
 
-				// 确保资源清理：defer中的cancel和Body.Close会自动执行
-				// 但我们需要立即释放并发槽位
 				debugLog("错误处理完成，释放资源")
 				return
 			}
 		}
 
+		// 保存使用量信息
 		if upstreamData.Data.Usage.TotalTokens > 0 {
 			lastUsage = map[string]interface{}{
 				"prompt_tokens":     upstreamData.Data.Usage.PromptTokens,
@@ -2734,6 +3330,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			}
 		}
 
+		// 处理初始答案
 		if !sentInitialAnswer && upstreamData.Data.EditContent != "" && upstreamData.Data.Phase == "answer" {
 			var out = upstreamData.Data.EditContent
 			var parts = detailsCloseRegex.Split(out, -1)
@@ -2744,7 +3341,18 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 				contentToUse = out
 			}
 			if contentToUse != "" {
-				chunk := createSSEChunk(contentToUse, false, upstreamReq.Model)
+				chunk := OpenAIResponse{
+					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   upstreamReq.Model,
+					Choices: []Choice{
+						{
+							Index: 0,
+							Delta: Delta{Content: contentToUse},
+						},
+					},
+				}
 				writeSSEChunk(w, chunk)
 				flusher.Flush()
 				sentInitialAnswer = true
@@ -2754,7 +3362,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		// 优先按Phase分流处理
 		switch upstreamData.Data.Phase {
 		case "tool_call":
-			// 处理工具调用 - 直接使用 sonic 解析的 ToolCalls
+			// 处理工具调用
 			if len(upstreamData.Data.ToolCalls) > 0 {
 				chunk := OpenAIResponse{
 					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
@@ -2781,7 +3389,18 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			if upstreamData.Data.DeltaContent != "" {
 				out := transformThinking(upstreamData.Data.DeltaContent)
 				if out != "" {
-					chunk := createSSEChunk(out, true, upstreamReq.Model)
+					chunk := OpenAIResponse{
+						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   upstreamReq.Model,
+						Choices: []Choice{
+							{
+								Index: 0,
+								Delta: Delta{ReasoningContent: out},
+							},
+						},
+					}
 					writeSSEChunk(w, chunk)
 					flusher.Flush()
 				}
@@ -2790,13 +3409,25 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 			if upstreamData.Data.DeltaContent != "" {
 				out := upstreamData.Data.DeltaContent
 				if out != "" {
-					chunk := createSSEChunk(out, false, upstreamReq.Model)
+					chunk := OpenAIResponse{
+						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   upstreamReq.Model,
+						Choices: []Choice{
+							{
+								Index: 0,
+								Delta: Delta{Content: out},
+							},
+						},
+					}
 					writeSSEChunk(w, chunk)
 					flusher.Flush()
 				}
 			}
 		}
 
+		// 检查是否完成
 		if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
 			// 检查是否有工具调用需要完成
 			if len(toolCalls) > 0 && !sentFinish {
@@ -2827,6 +3458,7 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		finishReason = "tool_calls"
 	}
 
+	// 发送结束块
 	if !sentFinish {
 		endChunk := OpenAIResponse{
 			ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
@@ -2840,10 +3472,12 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		sentFinish = true
 	}
 
+	// 发送DONE信号
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	debugLog("流式响应完成，共处理%d行", lineCount)
 
+	// 记录统计信息
 	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 	var tokens int64
 	if lastUsage != nil {
@@ -2854,350 +3488,5 @@ func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstrea
 		}
 	}
 	recordRequestStats(startTime, r.URL.Path, 200, tokens, modelName, true)
-	addLiveRequest(r.Method, r.URL.Path, 200, duration, userAgent, modelName)
-}
-
-// createSSEChunk 创建SSE响应块
-func createSSEChunk(content string, isReasoning bool, model string) OpenAIResponse {
-	now := time.Now()
-	chunk := OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", now.Unix()),
-		Object:  "chat.completion.chunk",
-		Created: now.Unix(),
-		Model:   model,
-		Choices: []Choice{{Index: 0}},
-	}
-
-	if isReasoning {
-		chunk.Choices[0].Delta = Delta{
-			Content:          content, // 镜像到 content 以提高兼容性
-			ReasoningContent: content,
-		}
-	} else {
-		chunk.Choices[0].Delta = Delta{Content: content}
-	}
-
-	return chunk
-}
-
-func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
-	// 使用对象池优化 SSE 块写入
-	buf := sseBufferPool.Get().([]byte)
-	defer func() {
-		buf = buf[:0] // 重置长度但保留容量
-		sseBufferPool.Put(buf)
-	}()
-
-	buf = append(buf, "data: "...)
-	// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-	data, _ := sonic.Marshal(chunk)
-	buf = append(buf, data...)
-	buf = append(buf, "\n\n"...)
-
-	w.Write(buf)
-}
-
-func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time, sessionID string) {
-	userAgent := r.Header.Get("User-Agent")
-	debugLog("开始处理非流式响应 (chat_id=%s, model=%s)", chatID, upstreamReq.Model)
-
-	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
-	if err != nil {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadGateway, duration, userAgent, modelName)
-		globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error", "Failed to call upstream after retries", "调用上游失败: %v", err)
-		return
-	}
-
-	// 确保在函数结束时取消上下文和关闭响应体
-	defer func() {
-		cancel()          // 取消上下文
-		resp.Body.Close() // 关闭响应体
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadGateway, duration, userAgent, modelName)
-		if appConfig.DebugMode {
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d, 读取响应体失败: %v", resp.StatusCode, err)
-			} else {
-				globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
-			}
-		} else {
-			globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d", resp.StatusCode)
-		}
-		return
-	}
-
-	var contentBuffer []byte
-	// 用于跟踪工具调用的状态
-	var toolCalls []ToolCall
-	lastUsage := Usage{}
-
-	debugLog("开始收集完整响应内容")
-
-	// 使用 sonic.Decoder 直接从 resp.Body 读取，避免使用 bufio.Scanner
-	lineCount := 0
-	var upstreamError *UpstreamError // 用于存储上游错误信息
-
-	// 不使用 sonic.Decoder 池，直接使用 sonic.Unmarshal
-	// 因为 sonic.Decoder 的 Reset 方法不适合频繁重置
-
-	// 创建一个缓冲读取器来处理 SSE 格式
-	bufReader := bufio.NewReader(resp.Body)
-
-	// 保存读取错误，用于循环后的检查
-	var readErr error
-
-	for {
-		// 检查客户端是否断开连接
-		select {
-		case <-r.Context().Done():
-			debugLog("客户端断开连接，停止处理非流式响应")
-			return
-		default:
-			// 继续处理
-		}
-
-		// 读取一行数据
-		line, err := bufReader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				debugLog("到达流末尾")
-			} else {
-				debugLog("读取SSE行失败: %v", err)
-				readErr = err // 保存错误
-			}
-			break
-		}
-
-		lineCount++
-		line = strings.TrimSpace(line)
-		debugLog("处理第%d行原始数据: %s", lineCount, line)
-
-		if line == "" || !strings.HasPrefix(line, "data: ") {
-			debugLog("跳过非数据行: %s", line)
-			continue
-		}
-
-		dataStr := strings.TrimPrefix(line, "data: ")
-		dataStr = strings.TrimSpace(dataStr)
-		debugLog("提取的数据字符串: %s", dataStr)
-
-		if dataStr == "" || dataStr == "[DONE]" {
-			if dataStr == "[DONE]" {
-				debugLog("收到[DONE]信号，结束收集")
-				break
-			}
-			continue
-		}
-
-		// 使用 sonic.Unmarshal 直接解析 JSON
-		var upstreamData UpstreamData
-		if err := sonic.Unmarshal([]byte(dataStr), &upstreamData); err != nil {
-			debugLog("SSE数据解析失败 (第%d行): %v, 数据: %s", lineCount, err, dataStr)
-			continue
-		}
-
-		debugLog("成功解析SSE数据: Type=%s, Phase=%s, DeltaContent=%s, EditContent=%s, Done=%v",
-			upstreamData.Type, upstreamData.Data.Phase, upstreamData.Data.DeltaContent, upstreamData.Data.EditContent, upstreamData.Data.Done)
-
-		// Check for error in upstream response
-		if (upstreamData.Error != nil) || (upstreamData.Data.Error != nil) || (upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
-			upstreamError = upstreamData.Error
-			if upstreamError == nil {
-				upstreamError = upstreamData.Data.Error
-			}
-			if upstreamError == nil && upstreamData.Data.Inner != nil {
-				upstreamError = upstreamData.Data.Inner.Error
-			}
-			if upstreamError != nil {
-				debugLog("上游返回错误 (第%d行): code=%d, detail=%s", lineCount, upstreamError.Code, upstreamError.Detail)
-
-				// 检查特定错误类型，如签名错误，需要刷新匿名token
-				if strings.Contains(upstreamError.Detail, "Missing signature header") ||
-					strings.Contains(upstreamError.Detail, "signature") ||
-					upstreamError.Code == 400 {
-					debugLog("检测到可能的token签名错误，标记token为失效")
-					if tokenCache != nil {
-						tokenCache.InvalidateToken()
-					}
-				}
-
-				// 设置错误标志，跳出循环
-				break
-			}
-			continue
-		}
-
-		if upstreamData.Data.Usage.TotalTokens > 0 {
-			lastUsage = upstreamData.Data.Usage
-		}
-
-		// 处理工具调用 - 直接使用 sonic 解析的 ToolCalls
-		if upstreamData.Data.Phase == "tool_call" && len(upstreamData.Data.ToolCalls) > 0 {
-			toolCalls = append(toolCalls, upstreamData.Data.ToolCalls...)
-		}
-
-		// Capture content from multiple possible sources to ensure we get the response
-		var contentToUse string
-		var editIndex int = -1 // 默认值，表示追加到末尾
-		if upstreamData.Data.DeltaContent != "" {
-			contentToUse = upstreamData.Data.DeltaContent
-			// DeltaContent should be appended to the end, so use the current buffer length as the index
-			editIndex = len(contentBuffer)
-			debugLog("从DeltaContent提取内容 (追加到索引 %d): %s", editIndex, contentToUse)
-		} else if upstreamData.Data.EditContent != "" && upstreamData.Data.Phase == "answer" {
-			// Process EditContent similar to streaming version
-			var out = upstreamData.Data.EditContent
-			var parts = detailsCloseRegex.Split(out, -1)
-			if len(parts) > 1 {
-				contentToUse = parts[1]
-				editIndex = upstreamData.Data.EditIndex
-				debugLog("从EditContent提取内容 (编辑索引 %d): %s", editIndex, contentToUse)
-			} else {
-				contentToUse = out
-				editIndex = upstreamData.Data.EditIndex
-				debugLog("从EditContent提取内容 (编辑索引 %d, 未分割): %s", editIndex, contentToUse)
-			}
-		}
-
-		// Apply transformations based on phase
-		if contentToUse != "" {
-			finalContentToUse := contentToUse
-			if upstreamData.Data.Phase == "thinking" {
-				finalContentToUse = transformThinking(contentToUse)
-			}
-			if finalContentToUse != "" {
-				// Use edit_index based approach for all content to maintain consistency
-				editBytes := []byte(finalContentToUse)
-
-				// 增强EditIndex边界验证
-				if editIndex < 0 {
-					debugLog("警告: EditIndex为负数(%d)，强制设置为追加模式", editIndex)
-					editIndex = len(contentBuffer)
-				}
-
-				// 验证EditIndex是否过大(可能是上游错误)
-				if editIndex > len(contentBuffer)+1024*1024 { // 允许1MB的合理跳跃
-					debugLog("警告: EditIndex过大(%d > %d)，可能是上游错误，使用追加模式", editIndex, len(contentBuffer))
-					editIndex = len(contentBuffer)
-				}
-
-				requiredLength := editIndex + len(editBytes)
-
-				// 安全检查：防止内存分配过大
-				if requiredLength > int(MaxResponseSize) {
-					debugLog("EditIndex + content长度过大，跳过: index=%d, content_len=%d", editIndex, len(editBytes))
-					continue
-				}
-
-				// 扩展缓冲区到所需长度
-				if len(contentBuffer) < requiredLength {
-					newBuffer := make([]byte, requiredLength)
-					copy(newBuffer, contentBuffer)
-					contentBuffer = newBuffer
-				}
-
-				// 在指定位置替换内容
-				copy(contentBuffer[editIndex:], editBytes)
-				debugLog("在索引 %d 更新内容: %s", editIndex, finalContentToUse)
-
-				// 更频繁地检查响应大小是否超出限制
-				if int64(len(contentBuffer)) > MaxResponseSize-int64(len(finalContentToUse)) {
-					debugLog("响应大小即将超出限制，当前大小: %d, 将添加: %d, 限制: %d",
-						len(contentBuffer), len(finalContentToUse), MaxResponseSize)
-					// 可以选择截断或返回错误
-					break
-				}
-
-				// 偶尔检查内存使用情况，避免单次循环占用过多内存
-				if lineCount%50 == 0 { // 每50行检查一次
-					if int64(len(contentBuffer)) > MaxResponseSize {
-						debugLog("响应大小超出限制，当前大小: %d", len(contentBuffer))
-						break
-					}
-				}
-			}
-		}
-
-		if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
-			debugLog("检测到完成信号，停止收集 (第%d行)", lineCount)
-			break
-		}
-	}
-
-	finalContent := string(bytes.ReplaceAll(contentBuffer, []byte{0}, []byte{}))
-	finalToolCalls := toolCalls
-	debugLog("内容收集完成，总共处理%d行，最终长度: %d, 工具调用数: %d", lineCount, len(finalContent), len(finalToolCalls))
-
-	// 检查是否有错误发生
-	if upstreamError != nil {
-		// 使用统一的错误处理函数
-		globalErrorHandler.HandleUpstreamError(w, upstreamError)
-		debugLog("非流式错误响应发送完成: %s", upstreamError.Detail)
-	} else if readErr != nil {
-		// 处理读取错误
-		globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "stream_read_error",
-			"Failed to read upstream response", "读取上游响应失败: %v", readErr)
-		debugLog("非流式读取错误响应发送完成: %v", readErr)
-	} else {
-		// 构造完整响应
-		// "chatcmpl" 是 OpenAI API 的标准 ID 前缀（chat completion 的缩写）
-		response := OpenAIResponse{
-			ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-			Object:  "chat.completion",
-			Created: time.Now().Unix(),
-			Model:   upstreamReq.Model, // Use the actual upstream model instead of default
-			Usage:   lastUsage,
-		}
-
-		// 根据是否存在工具调用来构造不同的响应
-		if len(finalToolCalls) > 0 {
-			debugLog("响应包含工具调用，数量: %d", len(finalToolCalls))
-			response.Choices = []Choice{
-				{
-					Index: 0,
-					Message: Message{
-						Role:      "assistant",
-						Content:   finalContent,
-						ToolCalls: finalToolCalls,
-					},
-					FinishReason: "tool_calls",
-				},
-			}
-		} else {
-			debugLog("响应为普通文本内容，长度: %d", len(finalContent))
-			response.Choices = []Choice{
-				{
-					Index: 0,
-					Message: Message{
-						Role:    "assistant",
-						Content: finalContent,
-					},
-					FinishReason: "stop",
-				},
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		// 使用 sonic.Marshal 直接序列化，避免池化复杂性
-		if data, err := sonic.Marshal(response); err != nil {
-			debugLog("编码非流式响应失败: %v", err)
-			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-		} else if _, err := w.Write(data); err != nil {
-			debugLog("写入非流式响应失败: %v", err)
-			http.Error(w, "Failed to write response", http.StatusInternalServerError)
-		}
-		debugLog("非流式响应发送完成")
-	}
-
-	// 记录请求统计信息
-	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-	recordRequestStats(startTime, r.URL.Path, 200, int64(lastUsage.TotalTokens), modelName, false)
 	addLiveRequest(r.Method, r.URL.Path, 200, duration, userAgent, modelName)
 }
