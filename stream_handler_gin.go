@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"z2api/types"
 )
 
 // GinStreamHandler 基于 Gin 的流式响应处理器
@@ -28,7 +29,7 @@ func NewGinStreamHandler(c *gin.Context, model string) *GinStreamHandler {
 }
 
 // WriteChunk 使用 Gin 的 SSEvent 写入响应块
-func (h *GinStreamHandler) WriteChunk(chunk OpenAIResponse) {
+func (h *GinStreamHandler) WriteChunk(chunk types.OpenAIResponse) {
 	// 使用 Gin 的流式写入
 	h.ctx.SSEvent("message", chunk)
 }
@@ -40,7 +41,7 @@ func (h *GinStreamHandler) WriteSSEData(data string) {
 }
 
 // ProcessThinkingPhase 处理思考阶段
-func (h *GinStreamHandler) ProcessThinkingPhase(data *UpstreamData) {
+func (h *GinStreamHandler) ProcessThinkingPhase(data *types.UpstreamData) {
 	if !h.inThinkingPhase {
 		h.inThinkingPhase = true
 	}
@@ -61,7 +62,7 @@ func (h *GinStreamHandler) ProcessThinkingPhase(data *UpstreamData) {
 }
 
 // ProcessAnswerPhase 处理回答阶段
-func (h *GinStreamHandler) ProcessAnswerPhase(data *UpstreamData) {
+func (h *GinStreamHandler) ProcessAnswerPhase(data *types.UpstreamData) {
 	content := data.Data.DeltaContent
 
 	// 处理edit_content（如果存在）
@@ -78,7 +79,7 @@ func (h *GinStreamHandler) ProcessAnswerPhase(data *UpstreamData) {
 }
 
 // ProcessToolCallPhase 处理工具调用阶段
-func (h *GinStreamHandler) ProcessToolCallPhase(data *UpstreamData) {
+func (h *GinStreamHandler) ProcessToolCallPhase(data *types.UpstreamData) {
 	if len(data.Data.ToolCalls) > 0 {
 		// 添加工具调用到管理器
 		h.toolCallMgr.AddToolCalls(data.Data.ToolCalls)
@@ -100,9 +101,9 @@ func (h *GinStreamHandler) ProcessToolCallPhase(data *UpstreamData) {
 }
 
 // ProcessOtherPhase 处理其他阶段
-func (h *GinStreamHandler) ProcessOtherPhase(data *UpstreamData) {
+func (h *GinStreamHandler) ProcessOtherPhase(data *types.UpstreamData) {
 	content := data.Data.DeltaContent
-	var usage *Usage
+	var usage *types.Usage
 
 	// 提取使用统计
 	if data.Data.Usage.TotalTokens > 0 {
@@ -127,7 +128,7 @@ func (h *GinStreamHandler) ProcessOtherPhase(data *UpstreamData) {
 }
 
 // ProcessPhase 根据阶段处理数据
-func (h *GinStreamHandler) ProcessPhase(data *UpstreamData) {
+func (h *GinStreamHandler) ProcessPhase(data *types.UpstreamData) {
 	if data == nil {
 		return
 	}
@@ -152,7 +153,7 @@ func (h *GinStreamHandler) ProcessPhase(data *UpstreamData) {
 }
 
 // ProcessDonePhase 处理完成阶段
-func (h *GinStreamHandler) ProcessDonePhase(data *UpstreamData) {
+func (h *GinStreamHandler) ProcessDonePhase(data *types.UpstreamData) {
 	if h.sentFinish {
 		return
 	}
@@ -185,10 +186,7 @@ func (h *GinStreamHandler) ProcessDonePhase(data *UpstreamData) {
 // HandleGinStreamResponse 使用 Gin Context 处理完整的流式响应
 func HandleGinStreamResponse(c *gin.Context, resp *io.ReadCloser, model string) error {
 	// 设置 SSE 响应头
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no") // 禁用 Nginx 缓冲
+	SetSSEHeaders(c)
 
 	// 创建流处理器
 	handler := NewGinStreamHandler(c, model)
@@ -241,7 +239,7 @@ func HandleGinStreamResponse(c *gin.Context, resp *io.ReadCloser, model string) 
 			}
 
 			// 解析JSON数据
-			var upstreamData UpstreamData
+			var upstreamData types.UpstreamData
 			if err := sonicStream.UnmarshalFromString(dataStr, &upstreamData); err != nil {
 				debugLog("解析上游数据失败: %v", err)
 				return true // 继续处理
@@ -271,7 +269,7 @@ type GinStreamAggregator struct {
 	Content          strings.Builder
 	ReasoningContent strings.Builder
 	ToolCallMgr      *ToolCallManager
-	Usage            *Usage
+	Usage            *types.Usage
 	Error            error
 	ErrorDetail      string
 }
@@ -297,7 +295,7 @@ func (a *GinStreamAggregator) ProcessLine(line string) bool {
 			return false // 结束处理
 		}
 
-		var upstreamData UpstreamData
+		var upstreamData types.UpstreamData
 		if err := sonicStream.UnmarshalFromString(dataStr, &upstreamData); err != nil {
 			debugLog("解析上游数据失败: %v", err)
 			return true
@@ -344,7 +342,7 @@ func (a *GinStreamAggregator) ProcessLine(line string) bool {
 }
 
 // GetResult 获取聚合结果
-func (a *GinStreamAggregator) GetResult() (string, string, []ToolCall, *Usage) {
+func (a *GinStreamAggregator) GetResult() (string, string, []types.ToolCall, *types.Usage) {
 	// 修复未闭合的think标签
 	reasoningContent := a.ReasoningContent.String()
 	if reasoningContent != "" {

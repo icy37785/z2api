@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"z2api/types"
+	"z2api/utils"
 )
 
 // GinHandleDashboard 处理仪表盘页面 (Gin 原生实现)
@@ -16,14 +18,13 @@ func GinHandleDashboard(c *gin.Context) {
 func GinHandleDashboardStats(c *gin.Context) {
 	// 检查 stats 是否已初始化
 	if stats == nil {
-		c.JSON(StatusInternalServerError, gin.H{
-			"error": "Stats not initialized",
-		})
+		utils.ErrorResponse(c, StatusInternalServerError, "internal_error",
+			"Stats not initialized", nil)
 		return
 	}
 
-	stats.mutex.RLock()
-	defer stats.mutex.RUnlock()
+	stats.Mutex.RLock()
+	defer stats.Mutex.RUnlock()
 
 	// 创建统计管理器实例
 	statsManager := NewStatsManager()
@@ -57,7 +58,7 @@ func GinHandleDashboardStats(c *gin.Context) {
 func GinHandleDashboardRequests(c *gin.Context) {
 	liveRequestsMutex.RLock()
 	// 创建切片的副本以避免在编码时持有锁
-	requests := make([]LiveRequest, len(liveRequests))
+	requests := make([]types.LiveRequest, len(liveRequests))
 	copy(requests, liveRequests)
 	liveRequestsMutex.RUnlock()
 
@@ -80,9 +81,9 @@ func GinHandleOptions(c *gin.Context) {
 func GinHandleHome(c *gin.Context) {
 	// 跟踪首页访问量
 	if stats != nil {
-		stats.mutex.Lock()
+		stats.Mutex.Lock()
 		stats.HomePageViews++
-		stats.mutex.Unlock()
+		stats.Mutex.Unlock()
 	}
 
 	c.Header("Content-Type", "text/html; charset=utf-8")
@@ -91,14 +92,8 @@ func GinHandleHome(c *gin.Context) {
 
 // GinHandleNotFound 处理 404 页面 (Gin 原生实现)
 func GinHandleNotFound(c *gin.Context) {
-	c.JSON(StatusNotFound, gin.H{
-		"error": gin.H{
-			"message": "Resource not found",
-			"type":    "not_found",
-			"code":    "not_found",
-			"path":    c.Request.URL.Path,
-		},
-	})
+	utils.ErrorResponse(c, StatusNotFound, "not_found",
+		"Resource not found", c.Request.URL.Path)
 }
 
 // StatsResponse 统计响应结构 (用于更好的类型安全)
@@ -126,14 +121,7 @@ type ModelUsageResponse struct {
 	Count int64  `json:"count"`
 }
 
-// 辅助函数：设置 SSE 响应头
-func setSSEHeaders(c *gin.Context) {
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no") // 禁用 Nginx 缓冲
-	c.Header("Access-Control-Allow-Origin", "*")
-}
+
 
 // 辅助函数：设置 JSON 响应头
 func setJSONHeaders(c *gin.Context) {

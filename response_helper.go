@@ -1,10 +1,21 @@
 package main
 
 import (
-	"fmt"
+	"sort"
 	"strings"
 	"time"
+	"z2api/types"
+	"z2api/utils"
+	"github.com/gin-gonic/gin"
 )
+
+// SetSSEHeaders 设置SSE（Server-Sent Events）响应头
+func SetSSEHeaders(c *gin.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+}
 
 // ResponsePhase 定义响应的不同阶段
 type ResponsePhase string
@@ -19,38 +30,38 @@ const (
 
 // createChatCompletionChunk 统一创建聊天完成响应块
 // 根据不同的phase创建对应格式的响应，保持响应格式的一致性
-func createChatCompletionChunk(content string, model string, phase ResponsePhase, usage *Usage, finishReason string) OpenAIResponse {
+func createChatCompletionChunk(content string, model string, phase ResponsePhase, usage *types.Usage, finishReason string) types.OpenAIResponse{
 	timestamp := time.Now().Unix()
-	response := OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", timestamp),
+	response := types.OpenAIResponse{
+		ID:      utils.GenerateChatCompletionID(),
 		Object:  "chat.completion.chunk",
 		Created: timestamp,
 		Model:   model,
-		Choices: []Choice{{Index: 0}},
+		Choices: []types.Choice{{Index: 0}},
 	}
 
 	switch phase {
 	case PhaseThinking:
 		// 思考阶段：设置reasoning_content
-		response.Choices[0].Delta = Delta{
+		response.Choices[0].Delta = types.Delta{
 			ReasoningContent: content,
 			Role:             "assistant",
 		}
 	case PhaseAnswer:
 		// 回答阶段：设置普通content
-		response.Choices[0].Delta = Delta{
+		response.Choices[0].Delta = types.Delta{
 			Content: content,
 			Role:    "assistant",
 		}
 	case PhaseToolCall:
 		// 工具调用阶段：设置content（工具相关内容）
-		response.Choices[0].Delta = Delta{
+		response.Choices[0].Delta = types.Delta{
 			Content: content,
 			Role:    "assistant",
 		}
 	case PhaseOther:
 		// 其他阶段：包含结束原因和使用统计
-		response.Choices[0].Delta = Delta{
+		response.Choices[0].Delta = types.Delta{
 			Content: content,
 			Role:    "assistant",
 		}
@@ -62,7 +73,7 @@ func createChatCompletionChunk(content string, model string, phase ResponsePhase
 		}
 	case PhaseDone:
 		// 完成阶段：仅设置结束原因
-		response.Choices[0].Delta = Delta{}
+		response.Choices[0].Delta = types.Delta{}
 		if finishReason != "" {
 			response.Choices[0].FinishReason = finishReason
 		}
@@ -72,17 +83,17 @@ func createChatCompletionChunk(content string, model string, phase ResponsePhase
 }
 
 // createToolCallChunk 创建工具调用响应块
-func createToolCallChunk(toolCalls []ToolCall, model string, finishReason string) OpenAIResponse {
+func createToolCallChunk(toolCalls []types.ToolCall, model string, finishReason string) types.OpenAIResponse{
 	timestamp := time.Now().Unix()
-	return OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", timestamp),
+	return types.OpenAIResponse{
+		ID:      utils.GenerateChatCompletionID(),
 		Object:  "chat.completion.chunk",
 		Created: timestamp,
 		Model:   model,
-		Choices: []Choice{
+		Choices: []types.Choice{
 			{
 				Index: 0,
-				Delta: Delta{
+				Delta: types.Delta{
 					Role:      "assistant",
 					ToolCalls: normalizeToolCalls(toolCalls),
 				},
@@ -142,52 +153,46 @@ func processAnswerContent(content string, editContent string) string {
 
 // ToolCallManager 管理工具调用的状态
 type ToolCallManager struct {
-	calls map[int]*ToolCall
+	calls map[int]*types.ToolCall
 }
 
 // NewToolCallManager 创建新的工具调用管理器
 func NewToolCallManager() *ToolCallManager {
 	return &ToolCallManager{
-		calls: make(map[int]*ToolCall),
+		calls: make(map[int]*types.ToolCall),
 	}
 }
 
 // AddToolCall 添加或更新工具调用
-func (m *ToolCallManager) AddToolCall(index int, call *ToolCall) {
-	if call != nil {
-		m.calls[index] = call
-	}
+func (m *ToolCallManager) AddToolCall(index int, call types.ToolCall) {
+	m.calls[index] = &call
 }
 
 // AddToolCalls 批量添加工具调用
-func (m *ToolCallManager) AddToolCalls(calls []ToolCall) {
+func (m *ToolCallManager) AddToolCalls(calls []types.ToolCall) {
 	for i := range calls {
-		m.AddToolCall(calls[i].Index, &calls[i])
+		m.AddToolCall(calls[i].Index, calls[i])
 	}
 }
 
 // GetSortedCalls 获取排序后的工具调用列表
-func (m *ToolCallManager) GetSortedCalls() []ToolCall {
+func (m *ToolCallManager) GetSortedCalls() []types.ToolCall{
 	if len(m.calls) == 0 {
 		return nil
 	}
 
 	// 转换为切片
-	result := make([]ToolCall, 0, len(m.calls))
+	result := make([]types.ToolCall, 0, len(m.calls))
 	for _, call := range m.calls {
 		if call != nil {
 			result = append(result, *call)
 		}
 	}
 
-	// 按索引排序
-	for i := 0; i < len(result); i++ {
-		for j := i + 1; j < len(result); j++ {
-			if result[i].Index > result[j].Index {
-				result[i], result[j] = result[j], result[i]
-			}
-		}
-	}
+	// 使用标准库的高效排序
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Index < result[j].Index
+	})
 
 	return result
 }
@@ -199,5 +204,5 @@ func (m *ToolCallManager) HasCalls() bool {
 
 // Clear 清空工具调用
 func (m *ToolCallManager) Clear() {
-	m.calls = make(map[int]*ToolCall)
+	m.calls = make(map[int]*types.ToolCall)
 }

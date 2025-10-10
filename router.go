@@ -7,6 +7,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/requestid"
 	"github.com/gin-gonic/gin"
+	"z2api/utils"
 )
 
 // setupRouter 设置并返回 Gin 路由器
@@ -104,14 +105,8 @@ func rateLimitMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 尝试获取信号量
 		if !concurrencyLimiter.TryAcquire(1) {
-			c.JSON(429, gin.H{
-				"error": gin.H{
-					"message": "Too many concurrent requests, please try again later",
-					"type":    "rate_limit_exceeded",
-					"code":    429,
-					"param":   nil,
-				},
-			})
+			utils.ErrorResponse(c, StatusTooManyRequests, "rate_limit_exceeded",
+				"Too many concurrent requests, please try again later", nil)
 			c.Abort()
 			return
 		}

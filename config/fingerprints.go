@@ -2,13 +2,13 @@ package config
 
 import (
 	"fmt"
-	"log"
 	"math/rand"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
+	"z2api/utils"
 )
 
 // Metadata contains descriptive info about the fingerprints file.
@@ -83,11 +83,11 @@ func LoadFingerprints(path string) error {
 		var validFingerprints []Fingerprint
 		for _, fp := range data.Fingerprints {
 			if fp.ID == "" {
-				log.Printf("Warning: Skipping fingerprint with empty ID")
+				utils.LogWarn("Skipping fingerprint with empty ID")
 				continue
 			}
 			if _, exists := data.fingerprintMap[fp.ID]; exists {
-				log.Printf("Warning: Duplicate fingerprint ID found, skipping: %s", fp.ID)
+				utils.LogWarn("Duplicate fingerprint ID found, skipping", "id", fp.ID)
 				continue
 			}
 			data.fingerprintMap[fp.ID] = fp
@@ -101,7 +101,7 @@ func LoadFingerprints(path string) error {
 		}
 
 		fingerprintsData = &data
-		log.Printf("Successfully loaded %d fingerprints (version: %s)", len(fingerprintsData.Fingerprints), fingerprintsData.Metadata.Version)
+		utils.LogInfo("Successfully loaded fingerprints", "count", len(fingerprintsData.Fingerprints), "version", fingerprintsData.Metadata.Version)
 	})
 	return err
 }

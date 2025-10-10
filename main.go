@@ -16,7 +16,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -26,76 +25,43 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
-	"github.com/bytedance/sonic/decoder"
 
 	// 内部包
 	"z2api/config"
 	"z2api/internal/signature"
+	"z2api/types"
 
 	// 第三方包
+	"z2api/utils"
+
 	"github.com/andybalholm/brotli"
-	"github.com/google/uuid"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
 
-// 自定义 sonic 配置 - 针对不同场景的优化配置
+// 优化的 sonic 配置 - 减少配置数量，提高维护性
 var (
-	// 默认配置：平衡性能和兼容性
-	sonicDefault = sonic.ConfigDefault
-
-	// 流式配置：优化SSE流处理
-	sonicStream = sonic.Config{
-		EscapeHTML:       false, // SSE不需要HTML转义
-		SortMapKeys:      false, // 不排序键，提高性能
-		CompactMarshaler: true,  // 紧凑输出
-		CopyString:       false, // 避免字符串复制
-		// 跳过原始消息验证以提高性能
-	}.Froze()
-
-	// 高性能配置：用于内部数据传输
-	sonicFast = sonic.Config{
-		EscapeHTML:            false,
-		SortMapKeys:           false,
-		CompactMarshaler:      true,
-		CopyString:            false,
+	// sonicInternal - 用于内部数据处理和流式响应
+	// 合并原来的 sonicStream 和 sonicFast，适用于所有内部处理场景
+	sonicInternal = sonic.Config{
+		EscapeHTML:            false, // 不需要HTML转义
+		SortMapKeys:           false, // 不排序键，提高性能
+		CompactMarshaler:      true,  // 紧凑输出
+		CopyString:            false, // 避免字符串复制
 		UseInt64:              false, // 使用更快的整数处理
 		UseNumber:             false, // 直接使用数字类型
 		DisallowUnknownFields: false, // 忽略未知字段
 		NoQuoteTextMarshaler:  true,  // 跳过文本引号处理
 	}.Froze()
 
-	// 兼容配置：用于外部API交互
-	sonicCompatible = sonic.Config{
-		EscapeHTML:       true,  // 保持HTML转义
-		SortMapKeys:      true,  // 排序键以保持一致性
-		CompactMarshaler: false, // 保持格式化
-		CopyString:       true,  // 复制字符串以避免引用问题
-		// 启用完整验证以确保兼容性
-	}.Froze()
-)
-
-// sonic 编码器/解码器对象池 - 减少内存分配
-var (
-	// 流式解码器池
-	streamDecoderPool = sync.Pool{
-		New: func() interface{} {
-			return decoder.NewStreamDecoder(nil)
-		},
-	}
+	// sonicDefault 作为别名，保持向后兼容
+	sonicDefault = sonic.ConfigDefault
+	// 为了兼容性，保留旧名称的别名
+	sonicStream = sonicInternal // 流式处理使用内部配置
+	sonicFast   = sonicInternal // 快速处理使用内部配置
 )
 
 // Config 配置结构体
-type Config struct {
-	UpstreamUrl           string
-	DefaultKey            string
-	UpstreamToken         string
-	Port                  string
-	DebugMode             bool
-	ThinkTagsMode         string
-	AnonTokenEnabled      bool
-	MaxConcurrentRequests int
-}
 
 // TokenCache Token缓存结构体
 type TokenCache struct {
@@ -121,7 +87,7 @@ func hashString(s string) uint32 {
 }
 
 // loadConfig 加载并验证配置
-func loadConfig() (*Config, error) {
+func loadConfig() (*types.Config, error) {
 	maxConcurrent := 100 // 默认值
 	if envVal := getEnv("MAX_CONCURRENT_REQUESTS", "100"); envVal != "100" {
 		if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 && parsed <= 1000 {
@@ -129,13 +95,9 @@ func loadConfig() (*Config, error) {
 		}
 	}
 
-	port := getEnv("PORT", "8080")
-	// 端口格式规范化：确保以冒号开头
-	if !strings.HasPrefix(port, ":") {
-		port = ":" + port
-	}
+	port := ":" + strings.TrimPrefix(getEnv("PORT", DefaultPort), ":")
 
-	config := &Config{
+	config := &types.Config{
 		UpstreamUrl:           getEnv("UPSTREAM_URL", "https://chat.z.ai/api/chat/completions"),
 		DefaultKey:            getEnv("API_KEY", "sk-tbkFoKzk9a531YyUNNF5"),
 		UpstreamToken:         getEnv("UPSTREAM_TOKEN", ""),
@@ -147,15 +109,15 @@ func loadConfig() (*Config, error) {
 	}
 
 	// 配置验证
-	if err := config.validate(); err != nil {
+	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
 
 	return config, nil
 }
 
-// validate 验证配置合法性，增强端口范围检查
-func (c *Config) validate() error {
+// validateConfig 验证配置合法性，增强端口范围检查
+func validateConfig(c *types.Config) error {
 	// 验证API密钥不能为空
 	if c.DefaultKey == "" {
 		return fmt.Errorf("API_KEY 环境变量是必需的，不能为空")
@@ -216,12 +178,12 @@ const (
 	SearchModelName         = "glm-4.5-search"
 	GLMAirModelName         = "glm-4.5-air"
 	GLMVision               = "glm-4.5v"
-	MaxResponseSize   int64 = 10 * 1024 * 1024 // 10MB
+	MaxResponseSize   int64 = DefaultMaxTokens // 10MB
 )
 
 // 全局配置和缓存实例
 var (
-	appConfig  *Config
+	appConfig  *types.Config
 	tokenCache *TokenCache
 )
 
@@ -235,41 +197,13 @@ var (
 )
 
 // RequestStats 请求统计结构
-type RequestStats struct {
-	TotalRequests        int64
-	SuccessfulRequests   int64
-	FailedRequests       int64
-	LastRequestTime      time.Time
-	AverageResponseTime  float64
-	HomePageViews        int64
-	ApiCallsCount        int64
-	ModelsCallsCount     int64
-	StreamingRequests    int64
-	NonStreamingRequests int64
-	TotalTokensUsed      int64
-	StartTime            time.Time
-	FastestResponse      float64
-	SlowestResponse      float64
-	ModelUsage           map[string]int64
-	mutex                sync.RWMutex
-}
 
 // LiveRequest 实时请求结构
-type LiveRequest struct {
-	ID        string    `json:"id"`
-	Timestamp time.Time `json:"timestamp"`
-	Method    string    `json:"method"`
-	Path      string    `json:"path"`
-	Status    int       `json:"status"`
-	Duration  float64   `json:"duration"`
-	UserAgent string    `json:"userAgent"`
-	Model     string    `json:"model,omitempty"`
-}
 
 // 全局统计实例
 var (
-	stats             *RequestStats
-	liveRequests      []LiveRequest
+	stats             *types.RequestStats
+	liveRequests      []types.LiveRequest
 	liveRequestsMutex sync.RWMutex
 )
 
@@ -301,9 +235,8 @@ var (
 	}
 
 	// 预编译的正则表达式模式
-	summaryRegex      = regexp.MustCompile(`(?s)<summary>.*?</summary>`)
-	detailsRegex      = regexp.MustCompile(`<details[^>]*>`)
-	detailsCloseRegex = regexp.MustCompile(`(?i)\s*</details\s*>`)
+	summaryRegex = regexp.MustCompile(`(?s)<summary>.*?</summary>`)
+	detailsRegex = regexp.MustCompile(`<details[^>]*>`)
 
 	// 字符串替换器
 	thinkingReplacer = strings.NewReplacer(
@@ -385,25 +318,15 @@ func (br *brotliReadCloser) Close() error {
 }
 
 // ToolCallFunction 工具调用函数结构
-type ToolCallFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}
 
 // ToolCall 工具调用结构 - 符合OpenAI API标准
-type ToolCall struct {
-	Index    int              `json:"-"`        // 内部使用，不序列化到JSON
-	ID       string           `json:"id"`       // 必需字段
-	Type     string           `json:"type"`     // 必需字段，通常为"function"
-	Function ToolCallFunction `json:"function"` // 必需字段
-}
 
 // normalizeToolCall 规范化工具调用，确保符合OpenAI API标准
 // 为缺失的必需字段生成默认值
-func normalizeToolCall(tc ToolCall) ToolCall {
+func normalizeToolCall(tc types.ToolCall) types.ToolCall {
 	// 确保有ID，如果没有则生成
 	if tc.ID == "" {
-		tc.ID = fmt.Sprintf("call_%s", uuid.New().String()[:8])
+		tc.ID = utils.GenerateToolCallID()
 	}
 
 	// 确保有Type，默认为"function"
@@ -425,12 +348,12 @@ func normalizeToolCall(tc ToolCall) ToolCall {
 }
 
 // normalizeToolCalls 批量规范化工具调用
-func normalizeToolCalls(calls []ToolCall) []ToolCall {
+func normalizeToolCalls(calls []types.ToolCall) []types.ToolCall {
 	if len(calls) == 0 {
 		return calls
 	}
 
-	normalized := make([]ToolCall, len(calls))
+	normalized := make([]types.ToolCall, len(calls))
 	for i, call := range calls {
 		normalized[i] = normalizeToolCall(call)
 	}
@@ -438,251 +361,55 @@ func normalizeToolCalls(calls []ToolCall) []ToolCall {
 }
 
 // ToolFunction 工具函数结构
-type ToolFunction struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  map[string]interface{} `json:"parameters"` // 使用具体类型而不是interface{}
-	// 添加更多工具函数参数以增强兼容性
-	Strict   *bool                  `json:"strict,omitempty"`   // 严格模式
-	Require  []string               `json:"require,omitempty"`  // 必需参数
-	Optional []string               `json:"optional,omitempty"` // 可选参数
-	Context  map[string]interface{} `json:"context,omitempty"`  // 上下文信息
-}
 
 // ToolChoiceFunction 工具选择函数结构
-type ToolChoiceFunction struct {
-	Name string `json:"name"`
-}
 
 // ToolChoice 工具选择结构
-type ToolChoice struct {
-	Type     string              `json:"type,omitempty"`
-	Function *ToolChoiceFunction `json:"function,omitempty"`
-}
 
 // Tool 工具结构
-type Tool struct {
-	Type     string       `json:"type"`
-	Function ToolFunction `json:"function"`
-	// 添加更多工具参数以增强兼容性
-	Description string                 `json:"description,omitempty"`
-	Parameters  map[string]interface{} `json:"parameters,omitempty"`
-	Strict      *bool                  `json:"strict,omitempty"`
-	Context     map[string]interface{} `json:"context,omitempty"`
-}
 
 // OpenAIRequest OpenAI 请求结构
-type OpenAIRequest struct {
-	Model             string                 `json:"model"`
-	Messages          []Message              `json:"messages"`
-	Stream            bool                   `json:"stream,omitempty"`
-	Temperature       *float64               `json:"temperature,omitempty"`       // 使用指针表示可选
-	MaxTokens         *int                   `json:"max_tokens,omitempty"`        // 使用指针表示可选
-	TopP              *float64               `json:"top_p,omitempty"`             // 使用指针表示可选
-	N                 *int                   `json:"n,omitempty"`                 // 使用指针表示可选
-	Stop              interface{}            `json:"stop,omitempty"`              // string or []string
-	PresencePenalty   *float64               `json:"presence_penalty,omitempty"`  // 使用指针表示可选
-	FrequencyPenalty  *float64               `json:"frequency_penalty,omitempty"` // 使用指针表示可选
-	LogitBias         map[string]float64     `json:"logit_bias,omitempty"`        // 修正为float64
-	User              string                 `json:"user,omitempty"`
-	Tools             []Tool                 `json:"tools,omitempty"`
-	ToolChoice        interface{}            `json:"tool_choice,omitempty"` // 保持interface{}以支持多种格式
-	ResponseFormat    interface{}            `json:"response_format,omitempty"`
-	Seed              *int                   `json:"seed,omitempty"` // 使用指针表示可选
-	LogProbs          bool                   `json:"logprobs,omitempty"`
-	TopLogProbs       *int                   `json:"top_logprobs,omitempty"`        // 使用指针，需要0-5验证
-	ParallelToolCalls *bool                  `json:"parallel_tool_calls,omitempty"` // 使用指针表示可选
-	ServiceTier       string                 `json:"service_tier,omitempty"`        // 新增：服务层级
-	Store             *bool                  `json:"store,omitempty"`               // 新增：是否存储
-	Metadata          map[string]interface{} `json:"metadata,omitempty"`            // 新增：元数据
-	// 符合OpenAI标准的兼容性参数
-	MaxCompletionTokens *int        `json:"max_completion_tokens,omitempty"` // 最大完成token数
-	TopK                *int        `json:"top_k,omitempty"`                 // Top-k采样
-	MinP                *float64    `json:"min_p,omitempty"`                 // Min-p采样
-	BestOf              *int        `json:"best_of,omitempty"`               // 最佳结果数
-	RepetitionPenalty   *float64    `json:"repetition_penalty,omitempty"`    // 重复惩罚
-	Grammar             interface{} `json:"grammar,omitempty"`               // 语法约束
-	GrammarType         string      `json:"grammar_type,omitempty"`          // 语法类型
-	// 保持向后兼容的参数
-	MaxInputTokens      *int `json:"max_input_tokens,omitempty"`      // 最大输入token数
-	MinCompletionTokens *int `json:"min_completion_tokens,omitempty"` // 最小完成token数
-	// 新增工具调用增强参数
-	ToolChoiceObject *ToolChoice `json:"-"` // 内部使用的解析后的ToolChoice对象
-}
 
 // ImageURL 图像URL结构
-type ImageURL struct {
-	URL    string `json:"url"`
-	Detail string `json:"detail,omitempty"` // low, high, auto
-}
 
 // VideoURL 视频URL结构
-type VideoURL struct {
-	URL string `json:"url"`
-}
 
 // DocumentURL 文档URL结构
-type DocumentURL struct {
-	URL string `json:"url"`
-}
 
 // AudioURL 音频URL结构
-type AudioURL struct {
-	URL string `json:"url"`
-}
 
 // ContentPart 内容部分结构（用于多模态消息）
-type ContentPart struct {
-	Type        string       `json:"type"`
-	Text        string       `json:"text,omitempty"`
-	ImageURL    *ImageURL    `json:"image_url,omitempty"`
-	VideoURL    *VideoURL    `json:"video_url,omitempty"`
-	DocumentURL *DocumentURL `json:"document_url,omitempty"`
-	AudioURL    *AudioURL    `json:"audio_url,omitempty"`
-	// 兼容性字段
-	URL      string `json:"url,omitempty"`       // 保持向后兼容
-	AltText  string `json:"alt_text,omitempty"`  // 替代文本
-	Size     int64  `json:"size,omitempty"`      // 文件大小
-	MimeType string `json:"mime_type,omitempty"` // MIME类型
-}
 
 // Message 消息结构（支持多模态内容）
-type Message struct {
-	Role             string      `json:"role"`
-	Content          interface{} `json:"content"` // 支持 string 或 []ContentPart
-	ReasoningContent string      `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCall  `json:"tool_calls,omitempty"`
-}
 
 // UpstreamMessage 上游消息结构（简化格式，仅支持字符串内容）
-type UpstreamMessage struct {
-	Role             string `json:"role"`
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
-}
 
 // UpstreamRequest 上游请求结构
-type UpstreamRequest struct {
-	Stream          bool                   `json:"stream"`
-	Model           string                 `json:"model"`
-	Messages        []UpstreamMessage      `json:"messages"`
-	Params          map[string]interface{} `json:"params"`
-	Features        map[string]interface{} `json:"features"`
-	BackgroundTasks map[string]bool        `json:"background_tasks,omitempty"`
-	ChatID          string                 `json:"chat_id,omitempty"`
-	ID              string                 `json:"id,omitempty"`
-	MCPServers      []string               `json:"mcp_servers,omitempty"`
-	ModelItem       struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		OwnedBy string `json:"owned_by"`
-	} `json:"model_item,omitempty"`
-	ToolServers []string          `json:"tool_servers,omitempty"`
-	Variables   map[string]string `json:"variables,omitempty"`
-	Tools       []Tool            `json:"tools,omitempty"`
-	ToolChoice  interface{}       `json:"tool_choice,omitempty"`
-}
 
 // OpenAIResponse OpenAI 响应结构
-type OpenAIResponse struct {
-	ID      string   `json:"id"`
-	Object  string   `json:"object"`
-	Created int64    `json:"created"`
-	Model   string   `json:"model"`
-	Choices []Choice `json:"choices"`
-	Usage   Usage    `json:"usage,omitempty"`
-}
 
 // Choice 选择结构
-type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message,omitempty"`
-	Delta        Delta   `json:"delta,omitempty"`
-	FinishReason string  `json:"finish_reason,omitempty"`
-}
 
 // Delta 增量结构
-type Delta struct {
-	Role             string     `json:"role,omitempty"`
-	Content          string     `json:"content,omitempty"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-}
 
 // Usage 用量结构
-type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
 
 // UpstreamData 上游SSE响应结构
-type UpstreamData struct {
-	Type string `json:"type"`
-	Data struct {
-		DeltaContent string         `json:"delta_content"`
-		EditContent  string         `json:"edit_content"`
-		Phase        string         `json:"phase"`
-		EditIndex    int            `json:"edit_index"`
-		Done         bool           `json:"done"`
-		Usage        Usage          `json:"usage,omitempty"`
-		Error        *UpstreamError `json:"error,omitempty"`
-		ToolCalls    []ToolCall     `json:"tool_calls,omitempty"`
-		Inner        *struct {
-			Error *UpstreamError `json:"error,omitempty"`
-		} `json:"data,omitempty"`
-	} `json:"data"`
-	Error *UpstreamError `json:"error,omitempty"`
-}
 
 // UpstreamError 上游错误结构
-type UpstreamError struct {
-	Detail string `json:"detail"`
-	Code   int    `json:"code"`
-}
 
 // ModelsResponse 模型列表响应
-type ModelsResponse struct {
-	Object string  `json:"object"`
-	Data   []Model `json:"data"`
-}
 
 // Model 模型结构
-type Model struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
-}
 
-// extractTextContent 从多模态内容中提取文本
+// extractTextContent 从多模态内容中提取文本（使用统一的多模态处理器）
 func extractTextContent(content interface{}) string {
-	switch v := content.(type) {
-	case string:
-		// 简单文本内容
-		return v
-	case []ContentPart:
-		// 新格式的多模态内容数组
-		var textParts []string
-		for _, part := range v {
-			if part.Type == "text" && part.Text != "" {
-				textParts = append(textParts, part.Text)
-			}
-		}
-		result := strings.Join(textParts, " ")
-		// 如果有内容且末尾没有空格，则添加空格以保持一致性
-		if len(result) > 0 && !strings.HasSuffix(result, " ") {
-			result += " "
-		}
-		return result
-	default:
-		// 其他类型，尝试转换为字符串
-		return fmt.Sprintf("%v", v)
-	}
+	processor := utils.NewMultimodalProcessor("")
+	return processor.ExtractText(content)
 }
 
 // extractLastUserContent 从 UpstreamRequest 中提取最后一条用户消息的内容
-func extractLastUserContent(req UpstreamRequest) string {
+func extractLastUserContent(req types.UpstreamRequest) string {
 	// 从后往前遍历消息，找到最后一条 role 为 "user" 的消息
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
@@ -693,106 +420,12 @@ func extractLastUserContent(req UpstreamRequest) string {
 	return ""
 }
 
-// processMultimodalContent 处理全方位多模态内容，支持图像、视频、文档、音频等
-func processMultimodalContent(parts []ContentPart, model string) string {
-	textContent := stringBuilderPool.Get().(*strings.Builder)
-	defer func() {
-		textContent.Reset()
-		stringBuilderPool.Put(textContent)
-	}()
-
-	var mediaStats = struct {
-		text      int
-		images    int
-		videos    int
-		documents int
-		audios    int
-		others    int
-	}{}
-
-	for i, part := range parts {
-		switch part.Type {
-		case "text":
-			if part.Text != "" {
-				textContent.WriteString(part.Text)
-				textContent.WriteString(" ")
-				mediaStats.text++
-			}
-		case "image_url":
-			if part.ImageURL != nil && part.ImageURL.URL != "" {
-				debugLog("检测到图像内容[%d]: %s (detail: %s)", i, part.ImageURL.URL, part.ImageURL.Detail)
-				mediaStats.images++
-
-				// 根据URL类型记录信息
-				if strings.HasPrefix(part.ImageURL.URL, "data:image/") {
-					// Base64编码的图像数据
-					dataSize := len(part.ImageURL.URL)
-					debugLog("图像数据大小: %d 字符 (~%dKB)", dataSize, dataSize*3/4/1024)
-				} else {
-					debugLog("图像URL: %s", part.ImageURL.URL)
-				}
-			}
-		case "video_url":
-			if part.VideoURL != nil && part.VideoURL.URL != "" {
-				debugLog("检测到视频内容[%d]: %s", i, part.VideoURL.URL)
-				mediaStats.videos++
-			}
-		case "document_url":
-			if part.DocumentURL != nil && part.DocumentURL.URL != "" {
-				debugLog("检测到文档内容[%d]: %s", i, part.DocumentURL.URL)
-				mediaStats.documents++
-			}
-		case "audio_url":
-			if part.AudioURL != nil && part.AudioURL.URL != "" {
-				debugLog("检测到音频内容[%d]: %s", i, part.AudioURL.URL)
-				mediaStats.audios++
-			}
-		default:
-			debugLog("检测到未知内容类型[%d]: %s", i, part.Type)
-			mediaStats.others++
-		}
-	}
-
-	// 记录媒体内容统计信息
-	totalMedia := mediaStats.images + mediaStats.videos + mediaStats.documents + mediaStats.audios
-	if totalMedia > 0 {
-		debugLog("多模态内容统计: 文本(%d) 图像(%d) 视频(%d) 文档(%d) 音频(%d) 其他(%d)",
-			mediaStats.text, mediaStats.images, mediaStats.videos, mediaStats.documents, mediaStats.audios, mediaStats.others)
-	}
-
-	// 对于支持多模态的模型（如glm-4.5v），可以保留更多上下文
-	if strings.Contains(strings.ToLower(model), "vision") || strings.Contains(strings.ToLower(model), "v") {
-		debugLog("模型 %s 支持全方位多模态理解", model)
-	} else {
-		debugLog("模型 %s 可能不支持多模态，仅保留文本内容", model)
-	}
-
-	return textContent.String()
+// processMultimodalContent 处理全方位多模态内容，支持图像、视频、文档、音频等（使用统一的多模态处理器）
+func processMultimodalContent(parts []types.ContentPart, model string) string {
+	processor := utils.NewMultimodalProcessor(model)
+	processor.EnableDebugLog = appConfig.DebugMode
+	return processor.ExtractText(parts)
 }
-
-// normalizeMultimodalMessage 规范化多模态消息格式
-func normalizeMultimodalMessage(msg Message, model string) UpstreamMessage {
-	// 检查是否为多模态消息
-	if contentParts, ok := msg.Content.([]ContentPart); ok {
-		// 处理多模态内容
-		textContent := processMultimodalContent(contentParts, model)
-		return UpstreamMessage{
-			Role:             normalizeRole(msg.Role),
-			Content:          textContent,
-			ReasoningContent: msg.ReasoningContent,
-		}
-	} else {
-		// 普通文本消息
-		textContent := extractTextContent(msg.Content)
-		return UpstreamMessage{
-			Role:             normalizeRole(msg.Role),
-			Content:          textContent,
-			ReasoningContent: msg.ReasoningContent,
-		}
-	}
-}
-
-// normalizeMessage 规范化消息格式，将多模态内容转换为上游可接受的格式
 
 // normalizeRole 规范化角色名称，处理OpenAI和Z.ai之间的差异
 func normalizeRole(role string) string {
@@ -805,21 +438,21 @@ func normalizeRole(role string) string {
 }
 
 // parseToolChoice 解析ToolChoice参数，支持多种格式
-func parseToolChoice(toolChoice interface{}) *ToolChoice {
+func parseToolChoice(toolChoice interface{}) *types.ToolChoice {
 	if toolChoice == nil {
 		return nil
 	}
 
 	// 检查是否是字符串格式 ("none", "auto", "required")
 	if choiceStr, ok := toolChoice.(string); ok {
-		return &ToolChoice{
+		return &types.ToolChoice{
 			Type: choiceStr,
 		}
 	}
 
 	// 检查是否是对象格式
 	if choiceMap, ok := toolChoice.(map[string]interface{}); ok {
-		toolChoiceObj := &ToolChoice{}
+		toolChoiceObj := &types.ToolChoice{}
 
 		if choiceType, exists := choiceMap["type"]; exists {
 			if typeStr, ok := choiceType.(string); ok {
@@ -829,7 +462,7 @@ func parseToolChoice(toolChoice interface{}) *ToolChoice {
 
 		if function, exists := choiceMap["function"]; exists {
 			if funcMap, ok := function.(map[string]interface{}); ok {
-				toolChoiceObj.Function = &ToolChoiceFunction{}
+				toolChoiceObj.Function = &types.ToolChoiceFunction{}
 				if name, exists := funcMap["name"]; exists {
 					if nameStr, ok := name.(string); ok {
 						toolChoiceObj.Function.Name = nameStr
@@ -845,7 +478,7 @@ func parseToolChoice(toolChoice interface{}) *ToolChoice {
 }
 
 // buildUpstreamParams 构建上游请求参数
-func buildUpstreamParams(req OpenAIRequest) map[string]interface{} {
+func buildUpstreamParams(req types.OpenAIRequest) map[string]interface{} {
 	params := make(map[string]interface{})
 
 	// 传递标准OpenAI参数（使用指针类型安全检查）
@@ -977,11 +610,10 @@ func maskJSONForLogging(jsonStr string) string {
 	return string(maskedBytes)
 }
 
-// debug日志函数
+// debugLog 兼容旧的调试日志函数，现在使用 utils 包的日志系统
 func debugLog(format string, args ...interface{}) {
-	if appConfig != nil && appConfig.DebugMode {
-		log.Printf("[DEBUG] "+format, args...)
-	}
+	// 转换为 utils.LogDebug 需要的键值对格式
+	utils.LogDebug(fmt.Sprintf(format, args...))
 }
 
 // transformThinking 转换思考内容
@@ -1029,28 +661,17 @@ func transformThinking(s string) string {
 
 // StatsCollector 异步统计数据收集器
 type StatsCollector struct {
-	requestChan chan StatsUpdate
+	requestChan chan types.StatsUpdate
 	quit        chan struct{}
 	wg          sync.WaitGroup
 }
 
 // StatsUpdate 统计更新数据
-type StatsUpdate struct {
-	startTime   time.Time
-	path        string
-	status      int
-	tokens      int64
-	model       string
-	isStreaming bool
-	duration    float64
-	userAgent   string
-	method      string
-}
 
 // NewStatsCollector 创建新的统计收集器
 func NewStatsCollector(bufferSize int) *StatsCollector {
 	sc := &StatsCollector{
-		requestChan: make(chan StatsUpdate, bufferSize),
+		requestChan: make(chan types.StatsUpdate, bufferSize),
 		quit:        make(chan struct{}),
 	}
 	sc.start()
@@ -1062,7 +683,7 @@ func (sc *StatsCollector) start() {
 	sc.wg.Add(1)
 	go func() {
 		defer sc.wg.Done()
-		batchUpdates := make([]StatsUpdate, 0, 10)       // 批量处理，最多10个
+		batchUpdates := make([]types.StatsUpdate, 0, 10) // 批量处理，最多10个
 		ticker := time.NewTicker(100 * time.Millisecond) // 每100ms处理一次
 		defer ticker.Stop()
 
@@ -1104,27 +725,27 @@ func (sc *StatsCollector) start() {
 }
 
 // processBatch 批量处理统计更新
-func (sc *StatsCollector) processBatch(updates []StatsUpdate) {
+func (sc *StatsCollector) processBatch(updates []types.StatsUpdate) {
 	if stats == nil {
 		return
 	}
 
-	stats.mutex.Lock()
-	defer stats.mutex.Unlock()
+	stats.Mutex.Lock()
+	defer stats.Mutex.Unlock()
 
 	for _, update := range updates {
 		// 更新基本统计
 		stats.TotalRequests++
 		stats.LastRequestTime = time.Now()
 
-		if update.status >= 200 && update.status < 300 {
+		if update.Status >= 200 && update.Status < 300 {
 			stats.SuccessfulRequests++
 		} else {
 			stats.FailedRequests++
 		}
 
 		// 更新端点统计
-		switch update.path {
+		switch update.Path {
 		case "/v1/chat/completions":
 			stats.ApiCallsCount++
 		case "/v1/models":
@@ -1134,32 +755,32 @@ func (sc *StatsCollector) processBatch(updates []StatsUpdate) {
 		}
 
 		// 更新token统计
-		if update.tokens > 0 {
-			stats.TotalTokensUsed += update.tokens
+		if update.Tokens > 0 {
+			stats.TotalTokensUsed += update.Tokens
 		}
 
 		// 更新模型使用统计
-		if update.model != "" {
-			stats.ModelUsage[update.model]++
+		if update.Model != "" {
+			stats.ModelUsage[update.Model]++
 		}
 
 		// 更新流式统计
-		if update.isStreaming {
+		if update.IsStreaming {
 			stats.StreamingRequests++
 		} else {
 			stats.NonStreamingRequests++
 		}
 
 		// 更新响应时间统计
-		if update.duration < stats.FastestResponse {
-			stats.FastestResponse = update.duration
+		if update.Duration < stats.FastestResponse {
+			stats.FastestResponse = update.Duration
 		}
-		if update.duration > stats.SlowestResponse {
-			stats.SlowestResponse = update.duration
+		if update.Duration > stats.SlowestResponse {
+			stats.SlowestResponse = update.Duration
 		}
 
 		// 更新平均响应时间
-		totalDuration := stats.AverageResponseTime*float64(stats.TotalRequests-1) + update.duration
+		totalDuration := stats.AverageResponseTime*float64(stats.TotalRequests-1) + update.Duration
 		stats.AverageResponseTime = totalDuration / float64(stats.TotalRequests)
 
 		// 添加实时请求记录（限制数量）
@@ -1167,21 +788,21 @@ func (sc *StatsCollector) processBatch(updates []StatsUpdate) {
 			// 移除最旧的请求（简单的滑动窗口）
 			liveRequests = liveRequests[1:]
 		}
-		liveRequests = append(liveRequests, LiveRequest{
-			ID:        uuid.New().String(),
+		liveRequests = append(liveRequests, types.LiveRequest{
+			ID:        utils.GenerateRequestID(),
 			Timestamp: time.Now(),
-			Method:    update.method,
-			Path:      update.path,
-			Status:    update.status,
-			Duration:  update.duration,
-			UserAgent: update.userAgent,
-			Model:     update.model,
+			Method:    update.Method,
+			Path:      update.Path,
+			Status:    update.Status,
+			Duration:  update.Duration,
+			UserAgent: update.UserAgent,
+			Model:     update.Model,
 		})
 	}
 }
 
 // Record 记录统计更新
-func (sc *StatsCollector) Record(update StatsUpdate) {
+func (sc *StatsCollector) Record(update types.StatsUpdate) {
 	select {
 	case sc.requestChan <- update:
 		// 成功发送到通道
@@ -1205,14 +826,14 @@ func recordRequestStats(startTime time.Time, path string, status int, tokens int
 	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 
 	if statsCollector != nil {
-		statsCollector.Record(StatsUpdate{
-			startTime:   startTime,
-			path:        path,
-			status:      status,
-			tokens:      tokens,
-			model:       model,
-			isStreaming: isStreaming,
-			duration:    duration,
+		statsCollector.Record(types.StatsUpdate{
+			StartTime:   startTime,
+			Path:        path,
+			Status:      status,
+			Tokens:      tokens,
+			Model:       model,
+			IsStreaming: isStreaming,
+			Duration:    duration,
 		})
 	}
 }
@@ -1220,27 +841,27 @@ func recordRequestStats(startTime time.Time, path string, status int, tokens int
 // addLiveRequest 异步添加实时请求记录
 func addLiveRequest(method string, path string, status int, duration float64, userAgent string, model string) {
 	if statsCollector != nil {
-		statsCollector.Record(StatsUpdate{
-			path:      path,
-			status:    status,
-			model:     model,
-			duration:  duration,
-			userAgent: userAgent,
-			method:    method,
+		statsCollector.Record(types.StatsUpdate{
+			Path:      path,
+			Status:    status,
+			Model:     model,
+			Duration:  duration,
+			UserAgent: userAgent,
+			Method:    method,
 		})
 	}
 }
 
 // StatsManager 统计数据管理器，提供线程安全的统计操作
 type StatsManager struct {
-	stats *RequestStats
+	stats *types.RequestStats
 	mutex sync.RWMutex
 }
 
 // NewStatsManager 创建新的统计管理器
 func NewStatsManager() *StatsManager {
 	return &StatsManager{
-		stats: &RequestStats{
+		stats: &types.RequestStats{
 			StartTime:       time.Now(),
 			ModelUsage:      make(map[string]int64),
 			FastestResponse: float64(time.Hour) / float64(time.Millisecond), // Initialize with a large value
@@ -1300,19 +921,19 @@ func (sm *StatsManager) GetTopModels() []struct {
 }
 
 // GetStats 安全地获取统计数据快照
-func (sm *StatsManager) GetStats() *RequestStats {
+func (sm *StatsManager) GetStats() *types.RequestStats {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
 
 	if sm.stats == nil {
-		return &RequestStats{
+		return &types.RequestStats{
 			StartTime:  time.Now(),
 			ModelUsage: make(map[string]int64),
 		}
 	}
 
 	// 创建数据副本以避免外部修改
-	statsCopy := &RequestStats{
+	statsCopy := &types.RequestStats{
 		TotalRequests:        sm.stats.TotalRequests,
 		SuccessfulRequests:   sm.stats.SuccessfulRequests,
 		FailedRequests:       sm.stats.FailedRequests,
@@ -1341,13 +962,13 @@ func (sm *StatsManager) GetStats() *RequestStats {
 // getClientIP 获取客户端IP
 
 // validateAndSanitizeInput 验证和清理输入数据，支持基于模型的动态验证
-func validateAndSanitizeInput(req *OpenAIRequest) error {
+func validateAndSanitizeInput(req *types.OpenAIRequest) error {
 	// 验证消息数量
 	if len(req.Messages) == 0 {
 		return fmt.Errorf("messages不能为空")
 	}
-	if len(req.Messages) > 100 { // 限制消息数量
-		return fmt.Errorf("消息数量过多，最多支持100条消息")
+	if len(req.Messages) > MaxMessagesPerRequest { // 限制消息数量
+		return fmt.Errorf("消息数量过多，最多支持%d条消息", MaxMessagesPerRequest)
 	}
 
 	// 验证和清理每条消息
@@ -1370,8 +991,8 @@ func validateAndSanitizeInput(req *OpenAIRequest) error {
 
 		// 验证内容长度
 		contentText := extractTextContent(msg.Content)
-		if len(contentText) > 500000 { // 单条消息最大500KB
-			return fmt.Errorf("单条消息内容过长，最大支持500KB")
+		if len(contentText) > MaxContentLength { // 单条消息最大500KB
+			return fmt.Errorf("单条消息内容过长，最大支持%d字节", MaxContentLength)
 		}
 		totalContentLength += len(contentText)
 
@@ -1431,17 +1052,8 @@ func validateAndSanitizeInput(req *OpenAIRequest) error {
 }
 
 // ErrorResponse 标准错误响应格式
-type ErrorResponse struct {
-	Error ErrorDetail `json:"error"`
-}
 
 // ErrorDetail 错误详情
-type ErrorDetail struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Code    int    `json:"code"`
-	Debug   string `json:"debug,omitempty"` // 仅在调试模式下显示
-}
 
 // 获取匿名token（每次对话使用不同token，避免共享记忆）
 // GetToken 从缓存或新获取Token，使用 singleflight 防止缓存击穿
@@ -1655,116 +1267,44 @@ func loadDashboardHTML() (string, error) {
 
 var dashboardHTML string
 
-// initSonicPretouch 初始化 sonic JIT 预热 - 扩展预热范围
-func initSonicPretouch() {
-	debugLog("开始扩展的 sonic JIT 预热...")
-
-	// 核心请求/响应结构
-	coreTypes := []reflect.Type{
-		reflect.TypeOf(OpenAIRequest{}),
-		reflect.TypeOf(OpenAIResponse{}),
-		reflect.TypeOf(UpstreamRequest{}),
-		reflect.TypeOf(UpstreamData{}),
-		reflect.TypeOf(Choice{}),
-		reflect.TypeOf(Message{}),
-		reflect.TypeOf(UpstreamMessage{}),
-		reflect.TypeOf(Delta{}),
-		reflect.TypeOf(Usage{}),
-	}
-
-	// 工具相关结构
-	toolTypes := []reflect.Type{
-		reflect.TypeOf(ToolCall{}),
-		reflect.TypeOf(ToolCallFunction{}),
-		reflect.TypeOf(Tool{}),
-		reflect.TypeOf(ToolFunction{}),
-		reflect.TypeOf(ToolChoice{}),
-		reflect.TypeOf(ToolChoiceFunction{}),
-	}
-
-	// 多模态内容结构
-	contentTypes := []reflect.Type{
-		reflect.TypeOf(ContentPart{}),
-		reflect.TypeOf(ImageURL{}),
-		reflect.TypeOf(VideoURL{}),
-		reflect.TypeOf(DocumentURL{}),
-		reflect.TypeOf(AudioURL{}),
-		reflect.TypeOf([]ContentPart{}),
-	}
-
-	// 错误和模型结构
-	utilTypes := []reflect.Type{
-		reflect.TypeOf(UpstreamError{}),
-		reflect.TypeOf(ErrorResponse{}),
-		reflect.TypeOf(ErrorDetail{}),
-		reflect.TypeOf(ModelsResponse{}),
-		reflect.TypeOf(Model{}),
-		reflect.TypeOf([]Model{}),
-		reflect.TypeOf(map[string]interface{}{}),
-		reflect.TypeOf([]interface{}{}),
-	}
-
-	// 统计结构
-	statsTypes := []reflect.Type{
-		reflect.TypeOf(RequestStats{}),
-		reflect.TypeOf(LiveRequest{}),
-		reflect.TypeOf([]LiveRequest{}),
-		reflect.TypeOf(StatsUpdate{}),
-	}
-
-	// 执行预热
-	allTypes := append(append(append(append(coreTypes, toolTypes...), contentTypes...), utilTypes...), statsTypes...)
-
-	successCount := 0
-	failCount := 0
-
-	for _, t := range allTypes {
-		if err := sonic.Pretouch(t); err != nil {
-			debugLog("预热 %v 失败: %v", t, err)
-			failCount++
-		} else {
-			successCount++
-		}
-	}
-
-	debugLog("sonic JIT 预热完成: 成功 %d 个类型，失败 %d 个类型", successCount, failCount)
-}
 
 // main is the entry point of the application
 func main() {
-	// 执行扩展的 JIT 预热
-	initSonicPretouch()
+	// 加载和验证配置（需要先加载配置，以便知道是否是调试模式）
+	var err error
+	appConfig, err = loadConfig()
+	if err != nil {
+		log.Fatalf("配置加载失败: %v", err)
+	}
+
+	// 初始化日志系统（必须在任何日志调用之前）
+	utils.InitLogger(appConfig.DebugMode)
+	utils.LogInfo("启动 OpenAI 兼容 API 服务器", "version", "1.0.0")
 
 	// 加载仪表板HTML
-	var err error
 	dashboardHTML, err = loadDashboardHTML()
 	if err != nil {
-		log.Printf("警告: 无法加载仪表板文件 'dashboard.html': %v. 仪表板功能可能不可用。", err)
+		utils.LogWarn("无法加载仪表板文件", "file", "dashboard.html", "error", err)
 		// 如果无法加载dashboard.html，使用一个简单的默认HTML
 		dashboardHTML = `<html><body><h1>Dashboard Unavailable</h1><p>Dashboard HTML file not found.</p></body></html>`
 	}
 
 	// 加载模型配置
 	if err := config.LoadModels("assets/models.json"); err != nil {
+		utils.LogError("无法加载模型配置文件", "file", "assets/models.json", "error", err)
 		log.Fatalf("错误: 无法加载模型配置文件 'assets/models.json': %v", err)
 	}
 
 	// 加载浏览器指纹配置
 	if err := config.LoadFingerprints("assets/fingerprints.json"); err != nil {
-		log.Printf("警告: 无法加载浏览器指纹文件 'assets/fingerprints.json': %v. 将使用默认指纹。", err)
-	}
-
-	// 加载和验证配置
-	appConfig, err = loadConfig()
-	if err != nil {
-		log.Fatalf("配置加载失败: %v", err)
+		utils.LogWarn("无法加载浏览器指纹文件", "file", "assets/fingerprints.json", "error", err)
 	}
 
 	// 初始化Token缓存
 	tokenCache = &TokenCache{}
 
 	// 初始化统计信息
-	stats = &RequestStats{
+	stats = &types.RequestStats{
 		StartTime:       time.Now(),
 		ModelUsage:      make(map[string]int64),
 		FastestResponse: float64(time.Hour) / float64(time.Millisecond), // Initialize with a large value
@@ -1778,22 +1318,22 @@ func main() {
 	concurrencyLimiter = semaphore.NewWeighted(int64(appConfig.MaxConcurrentRequests))
 
 	// 设置 Gin 路由
-	log.Println("初始化 Gin 路由...")
-	log.Println("使用 Gin 原生处理器")
+	utils.LogInfo("初始化 Gin 路由", "handler", "Gin原生")
 
 	router := setupRouter()
 
 	// 初始化全局错误处理器
 
-	log.Printf("OpenAI兼容API服务器启动在端口%s", appConfig.Port)
-	log.Printf("模型: %s", DefaultModelName)
-	log.Printf("上游: %s", appConfig.UpstreamUrl)
-	log.Printf("Debug模式: %v", appConfig.DebugMode)
-	log.Printf("匿名Token: %v", appConfig.AnonTokenEnabled)
-	log.Printf("思考标签模式: %s", appConfig.ThinkTagsMode)
-	log.Printf("并发限制: %d", appConfig.MaxConcurrentRequests)
-	log.Printf("健康检查端点: http://localhost%s/health", appConfig.Port)
-	log.Printf("Dashboard端点: http://localhost%s/dashboard", appConfig.Port)
+	utils.LogInfo("服务器配置",
+		"port", appConfig.Port,
+		"model", DefaultModelName,
+		"upstream", appConfig.UpstreamUrl,
+		"debug", appConfig.DebugMode,
+		"anon_token", appConfig.AnonTokenEnabled,
+		"think_tags", appConfig.ThinkTagsMode,
+		"concurrency", appConfig.MaxConcurrentRequests,
+		"health_endpoint", fmt.Sprintf("http://localhost%s/health", appConfig.Port),
+		"dashboard_endpoint", fmt.Sprintf("http://localhost%s/dashboard", appConfig.Port))
 
 	// 使用 Gin 的底层 http.Server 配置
 	server := &http.Server{
@@ -1812,7 +1352,7 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Println("收到关闭信号，开始优雅关闭服务器...")
+		utils.LogInfo("收到关闭信号，开始优雅关闭服务器")
 
 		// 停止统计收集器
 		if statsCollector != nil {
@@ -1824,43 +1364,21 @@ func main() {
 		defer shutdownCancel()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("服务器关闭时出现错误: %v", err)
+			utils.LogError("服务器关闭时出现错误", "error", err)
 		} else {
-			log.Println("服务器已优雅关闭")
+			utils.LogInfo("服务器已优雅关闭")
 		}
 	}()
 
-	log.Fatal(server.ListenAndServe())
-}
-
-// handleHealth 健康检查端点
-// 优化：使用 sonic 编码健康检查响应
-
-// getModelsList 获取模型列表，支持优雅降级
-func getModelsList() ModelsResponse {
-	// 从配置动态生成模型列表
-	loadedModels := config.GetAllModels()
-	apiModels := make([]Model, len(loadedModels))
-	now := time.Now().Unix()
-
-	for i, m := range loadedModels {
-		apiModels[i] = Model{
-			ID:      m.ID,
-			Object:  "model",
-			Created: now,
-			OwnedBy: "z.ai",
-		}
-	}
-
-	return ModelsResponse{
-		Object: "list",
-		Data:   apiModels,
+	if err := server.ListenAndServe(); err != nil {
+		utils.LogError("服务器启动失败", "error", err)
+		log.Fatal(err)
 	}
 }
 
 // callUpstreamWithHeaders 调用上游API
 // 优化：使用 sonic 对象池进行序列化
-func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
+func callUpstreamWithHeaders(upstreamReq types.UpstreamRequest, refererChatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
 	// 创建带超时的上下文 - 根据请求类型动态调整超时时间
 	var timeout time.Duration
 	if upstreamReq.Stream {
@@ -1891,7 +1409,7 @@ func callUpstreamWithHeaders(upstreamReq UpstreamRequest, refererChatID string, 
 	debugLog("上游请求体: %s", maskJSONForLogging(string(data)))
 
 	// 生成签名所需的参数
-	requestID := uuid.New().String()
+	requestID := utils.GenerateRequestID()
 	timestamp := time.Now().UnixMilli()
 	userContent := extractLastUserContent(upstreamReq)
 
@@ -2142,7 +1660,7 @@ func calculateBackoffDelay(attempt int, baseDelay time.Duration, maxDelay time.D
 }
 
 // callUpstreamWithRetry 调用上游API并处理重试，改进资源管理和超时控制
-func callUpstreamWithRetry(upstreamReq UpstreamRequest, chatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
+func callUpstreamWithRetry(upstreamReq types.UpstreamRequest, chatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
 	var lastErr error
 	maxRetries := 5 // 增加到5次重试
 	baseDelay := 100 * time.Millisecond

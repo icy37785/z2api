@@ -5,15 +5,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"z2api/internal/signature"
+	"z2api/types"
+	"z2api/utils"
 )
 
 // MessageConverter 消息转换器，参考 Python 版本的 prepare_data 函数
 type MessageConverter struct {
 	authToken     string
 	uploader      *ImageUploader
-	featureConfig FeatureConfig
+	featureConfig FeatureConfig // 使用本地的 FeatureConfig 类型
 }
 
 // NewMessageConverter 创建新的消息转换器
@@ -27,19 +28,19 @@ func NewMessageConverter(authToken string, modelID string, streaming bool) *Mess
 
 // PrepareData 准备上游请求数据
 // 参考 Python 版本的 prepare_data 函数
-func (mc *MessageConverter) PrepareData(req OpenAIRequest, sessionID string) (UpstreamRequest, map[string]string, error) {
+func (mc *MessageConverter) PrepareData(req types.OpenAIRequest, sessionID string) (types.UpstreamRequest, map[string]string, error) {
 	// 生成会话相关ID
-	chatID := uuid.New().String()
-	msgID := uuid.New().String()
+	chatID := utils.GenerateUUID()
+	msgID := utils.GenerateUUID()
 
 	// 转换消息并处理图片
 	processedMessages, files, err := mc.processMessages(req.Messages)
 	if err != nil {
-		return UpstreamRequest{}, nil, fmt.Errorf("处理消息失败: %w", err)
+		return types.UpstreamRequest{}, nil, fmt.Errorf("处理消息失败: %w", err)
 	}
 
 	// 构建上游请求
-	upstreamReq := UpstreamRequest{
+	upstreamReq := types.UpstreamRequest{
 		Stream:          true, // 总是使用流式从上游获取
 		Model:           req.Model,
 		Messages:        processedMessages,
@@ -67,118 +68,90 @@ func (mc *MessageConverter) PrepareData(req OpenAIRequest, sessionID string) (Up
 	return upstreamReq, params, nil
 }
 
-// processMessages 处理消息列表，转换多模态内容并上传图片
-func (mc *MessageConverter) processMessages(messages []Message) ([]UpstreamMessage, []map[string]interface{}, error) {
-	var processedMessages []UpstreamMessage
+// processMessages 处理消息列表，转换多模态内容并上传图片（使用统一的多模态处理器）
+func (mc *MessageConverter) processMessages(messages []types.Message) ([]types.UpstreamMessage, []map[string]interface{}, error) {
+	var processedMessages []types.UpstreamMessage
 	var files []map[string]interface{}
+	
+	// 创建多模态处理器
+	processor := utils.NewMultimodalProcessor("")
+	processor.EnableDebugLog = appConfig.DebugMode
 
 	for _, msg := range messages {
-		// 处理纯文本消息
-		if content, ok := msg.Content.(string); ok {
-			processedMessages = append(processedMessages, UpstreamMessage{
-				Role:             normalizeRole(msg.Role),
-				Content:          content,
-				ReasoningContent: msg.ReasoningContent,
-			})
-			continue
-		}
-
-		// 处理多模态消息
-		textContent, imageFiles, err := mc.processMultimodalContent(msg)
-		if err != nil {
-			debugLog("处理多模态内容失败: %v", err)
-			// 继续处理，但不包含图片
-			processedMessages = append(processedMessages, UpstreamMessage{
-				Role:             normalizeRole(msg.Role),
-				Content:          textContent,
-				ReasoningContent: msg.ReasoningContent,
-			})
-			continue
+		// 使用统一处理器处理内容
+		result, err := processor.ProcessContent(msg.Content)
+		
+		var textContent string
+		if err == nil {
+			textContent = result.Text
+			
+			// 处理图片文件上传
+			for _, imageURL := range result.Images {
+				fileID, uploadErr := mc.uploadImage(imageURL)
+				if uploadErr != nil {
+					debugLog("上传图片失败: %v", uploadErr)
+					continue
+				}
+				files = append(files, map[string]interface{}{
+					"type": "image",
+					"id":   fileID,
+				})
+			}
+			
+			// 处理其他已有文件ID的文件
+			for _, file := range result.Files {
+				if file.FileID != "" {
+					files = append(files, map[string]interface{}{
+						"type": file.Type,
+						"id":   file.FileID,
+					})
+				}
+			}
+		} else {
+			// 如果处理失败，尝试将内容转换为字符串
+			if content, ok := msg.Content.(string); ok {
+				textContent = content
+			} else {
+				textContent = ""
+			}
 		}
 
 		// 添加处理后的消息
-		processedMessages = append(processedMessages, UpstreamMessage{
+		processedMessages = append(processedMessages, types.UpstreamMessage{
 			Role:             normalizeRole(msg.Role),
 			Content:          textContent,
 			ReasoningContent: msg.ReasoningContent,
 		})
-
-		// 收集文件信息
-		files = append(files, imageFiles...)
 	}
 
 	return processedMessages, files, nil
 }
 
-// processMultimodalContent 处理多模态内容
-func (mc *MessageConverter) processMultimodalContent(msg Message) (string, []map[string]interface{}, error) {
-	var textContent strings.Builder
+// processMultimodalContent 处理多模态内容（已被processMessages方法替代，保留作为向后兼容）
+func (mc *MessageConverter) processMultimodalContent(msg types.Message) (string, []map[string]interface{}, error) {
+	processor := utils.NewMultimodalProcessor("")
+	result, err := processor.ProcessContent(msg.Content)
+	
+	if err != nil {
+		return "", nil, err
+	}
+	
 	var files []map[string]interface{}
-
-	// 处理 interface{} 类型的数组
-	if parts, ok := msg.Content.([]interface{}); ok {
-		for _, part := range parts {
-			partMap, ok := part.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			partType, _ := partMap["type"].(string)
-
-			switch partType {
-			case "text":
-				if text, ok := partMap["text"].(string); ok {
-					if textContent.Len() > 0 {
-						textContent.WriteString(" ")
-					}
-					textContent.WriteString(text)
-				}
-
-			case "image_url":
-				if imageURL, ok := partMap["image_url"].(map[string]interface{}); ok {
-					if url, ok := imageURL["url"].(string); ok {
-						fileID, err := mc.uploadImage(url)
-						if err != nil {
-							debugLog("上传图片失败: %v", err)
-							continue
-						}
-						files = append(files, map[string]interface{}{
-							"type": "image",
-							"id":   fileID,
-						})
-					}
-				}
-			}
+	
+	// 处理图片上传
+	for _, imageURL := range result.Images {
+		fileID, uploadErr := mc.uploadImage(imageURL)
+		if uploadErr != nil {
+			debugLog("上传图片失败: %v", uploadErr)
+			continue
 		}
+		files = append(files, map[string]interface{}{
+			"type": "image",
+			"id":   fileID,
+		})
 	}
-
-	// 处理 ContentPart 数组
-	if parts, ok := msg.Content.([]ContentPart); ok {
-		for _, part := range parts {
-			switch part.Type {
-			case "text":
-				if textContent.Len() > 0 {
-					textContent.WriteString(" ")
-				}
-				textContent.WriteString(part.Text)
-
-			case "image_url":
-				if part.ImageURL != nil && part.ImageURL.URL != "" {
-					fileID, err := mc.uploadImage(part.ImageURL.URL)
-					if err != nil {
-						debugLog("上传图片失败: %v", err)
-						continue
-					}
-					files = append(files, map[string]interface{}{
-						"type": "image",
-						"id":   fileID,
-					})
-				}
-			}
-		}
-	}
-
-	return textContent.String(), files, nil
+	
+	return result.Text, files, nil
 }
 
 // uploadImage 上传图片并返回文件ID
@@ -197,7 +170,7 @@ func (mc *MessageConverter) uploadImage(url string) (string, error) {
 // buildRequestParams 构建请求参数
 // 参考 Python 版本的参数构建逻辑
 func (mc *MessageConverter) buildRequestParams(chatID, sessionID string) map[string]string {
-	requestID := uuid.New().String()
+	requestID := utils.GenerateRequestID()
 	timestamp := time.Now().UnixMilli()
 
 	params := map[string]string{
@@ -239,56 +212,56 @@ func CreateChatCompletionData(
 	content string,
 	model string,
 	phase string,
-	usage *Usage,
+	usage *types.Usage,
 	finishReason string,
-) OpenAIResponse {
+) types.OpenAIResponse{
 	timestamp := time.Now().Unix()
-	responseID := fmt.Sprintf("chatcmpl-%s", uuid.New().String())
+	responseID := utils.GenerateChatCompletionID()
 
-	var delta Delta
+	var delta types.Delta
 
 	switch phase {
 	case "thinking":
-		delta = Delta{
+		delta = types.Delta{
 			ReasoningContent: content,
 			Role:             "assistant",
 		}
 		finishReason = ""
 
 	case "answer":
-		delta = Delta{
+		delta = types.Delta{
 			Content: content,
 			Role:    "assistant",
 		}
 		finishReason = ""
 
 	case "tool_call":
-		delta = Delta{
+		delta = types.Delta{
 			Content: content,
 			Role:    "assistant",
 		}
 		finishReason = ""
 
 	case "other":
-		delta = Delta{
+		delta = types.Delta{
 			Content: content,
 			Role:    "assistant",
 		}
 		// finishReason 保持传入的值
 
 	default:
-		delta = Delta{
+		delta = types.Delta{
 			Content: content,
 			Role:    "assistant",
 		}
 	}
 
-	response := OpenAIResponse{
+	response := types.OpenAIResponse{
 		ID:      responseID,
 		Object:  "chat.completion.chunk",
 		Created: timestamp,
 		Model:   model,
-		Choices: []Choice{
+		Choices: []types.Choice{
 			{
 				Index:        0,
 				Delta:        delta,

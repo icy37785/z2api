@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"z2api/config"
+	"z2api/types"
+	"z2api/utils"
 )
 
 // Features 定义模型特性配置
@@ -154,7 +156,7 @@ func mergeWithModelConfig(dynamic FeatureConfig, modelConfig config.ModelConfig)
 
 // ConvertedMessages 转换后的消息结构
 type ConvertedMessages struct {
-	Messages  []UpstreamMessage
+	Messages  []types.UpstreamMessage
 	ImageURLs []string
 	Files     []File
 }
@@ -165,107 +167,67 @@ type File struct {
 	ID   string `json:"id"`
 }
 
-// convertMultimodalMessages 转换多模态消息
-func convertMultimodalMessages(messages []Message) ConvertedMessages {
+// convertMultimodalMessages 转换多模态消息（使用统一的多模态处理器）
+func convertMultimodalMessages(messages []types.Message) ConvertedMessages {
 	result := ConvertedMessages{
-		Messages:  make([]UpstreamMessage, 0),
+		Messages:  make([]types.UpstreamMessage, 0),
 		ImageURLs: make([]string, 0),
 		Files:     make([]File, 0),
 	}
 
+	processor := utils.NewMultimodalProcessor("")
+
 	for _, msg := range messages {
-		// 处理字符串内容
-		if content, ok := msg.Content.(string); ok {
-			upstreamMsg := UpstreamMessage{
-				Role:    msg.Role,
-				Content: content,
-			}
-
-			// 添加推理内容（如果有）
-			if msg.ReasoningContent != "" {
-				upstreamMsg.ReasoningContent = msg.ReasoningContent
-			}
-
-			result.Messages = append(result.Messages, upstreamMsg)
-			continue
+		// 使用统一处理器处理内容
+		processResult, err := processor.ProcessContent(msg.Content)
+		
+		// 创建上游消息
+		upstreamMsg := types.UpstreamMessage{
+			Role: msg.Role,
 		}
-
-		// 处理数组内容（多模态）
-		if parts, ok := msg.Content.([]interface{}); ok {
-			var textContent strings.Builder
-
-			for _, part := range parts {
-				partMap, ok := part.(map[string]interface{})
-				if !ok {
-					continue
-				}
-
-				partType, _ := partMap["type"].(string)
-
-				switch partType {
-				case "text":
-					// 处理文本部分
-					if text, ok := partMap["text"].(string); ok {
-						if textContent.Len() > 0 {
-							textContent.WriteString("\n")
-						}
-						textContent.WriteString(text)
-					}
-
-				case "image_url":
-					// 处理图像URL
-					if imageURL, ok := partMap["image_url"].(map[string]interface{}); ok {
-						if url, ok := imageURL["url"].(string); ok {
-							result.ImageURLs = append(result.ImageURLs, url)
-
-							// 判断图片类型并添加到Files
-							if strings.HasPrefix(url, "data:image/") {
-								// Base64编码的图片
-								result.Files = append(result.Files, File{
-									Type: "image",
-									ID:   "base64_image", // 实际使用时需要上传后获取真实ID
-								})
-							} else if strings.HasPrefix(url, "http") {
-								// URL图片
-								result.Files = append(result.Files, File{
-									Type: "image",
-									ID:   "url_image", // 实际使用时需要上传后获取真实ID
-								})
-							}
-						}
-					}
-
-				case "file":
-					// 处理文件
-					if fileID, ok := partMap["file_id"].(string); ok {
-						fileType := "document"
-						if ft, ok := partMap["file_type"].(string); ok {
-							fileType = ft
-						}
-						result.Files = append(result.Files, File{
-							Type: fileType,
-							ID:   fileID,
-						})
+		
+		if err == nil {
+			upstreamMsg.Content = processResult.Text
+			
+			// 收集图片URL
+			result.ImageURLs = append(result.ImageURLs, processResult.Images...)
+			
+			// 转换文件信息
+			for _, file := range processResult.Files {
+				fileID := file.FileID
+				if fileID == "" {
+					// 如果没有FileID，使用占位符（实际使用时需要上传）
+					if strings.HasPrefix(file.URL, "data:image/") {
+						fileID = "base64_image"
+					} else if strings.HasPrefix(file.URL, "http") {
+						fileID = "url_image"
+					} else {
+						fileID = "unknown"
 					}
 				}
-			}
-
-			// 如果有文本内容，添加到消息中
-			if textContent.Len() > 0 {
-				result.Messages = append(result.Messages, UpstreamMessage{
-					Role:    msg.Role,
-					Content: textContent.String(),
+				
+				result.Files = append(result.Files, File{
+					Type: file.Type,
+					ID:   fileID,
 				})
 			}
+		} else {
+			// 如果处理失败，尝试将内容转换为字符串
+			if content, ok := msg.Content.(string); ok {
+				upstreamMsg.Content = content
+			} else {
+				upstreamMsg.Content = ""
+			}
 		}
-
-		// 如果消息没有内容但有工具调用，需要设置默认内容
-		if msg.Content == nil && len(msg.ToolCalls) > 0 {
-			// 工具调用消息通常需要一个空内容
-			result.Messages = append(result.Messages, UpstreamMessage{
-				Role:    msg.Role,
-				Content: "",
-			})
+		
+		// 添加推理内容（如果有）
+		if msg.ReasoningContent != "" {
+			upstreamMsg.ReasoningContent = msg.ReasoningContent
+		}
+		
+		// 如果有内容或工具调用，添加消息
+		if upstreamMsg.Content != "" || len(msg.ToolCalls) > 0 || msg.Content == nil {
+			result.Messages = append(result.Messages, upstreamMsg)
 		}
 	}
 

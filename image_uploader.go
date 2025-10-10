@@ -10,7 +10,8 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
-	"github.com/google/uuid"
+	"z2api/types"
+	"z2api/utils"
 )
 
 // ImageUploader 图片上传器，参考 Python 版本的 ImageUploader 类
@@ -86,7 +87,7 @@ func (iu *ImageUploader) UploadImageFromURL(imageURL string) (string, error) {
 // uploadImageData 上传图片数据到服务器
 func (iu *ImageUploader) uploadImageData(imageData []byte) (string, error) {
 	// 生成唯一文件名
-	fileName := fmt.Sprintf("image_%s.jpg", uuid.New().String())
+	fileName := fmt.Sprintf("image_%s.jpg", utils.GenerateUUID())
 
 	// 构建上传请求
 	uploadReq := map[string]interface{}{
@@ -140,120 +141,75 @@ func (iu *ImageUploader) uploadImageData(imageData []byte) (string, error) {
 	return uploadResp.FileID, nil
 }
 
-// ProcessMultimodalMessages 处理包含图片的多模态消息
+// ProcessMultimodalMessages 处理包含图片的多模态消息（使用统一的多模态处理器）
 // 参考 Python 版本的 convert_messages 函数
-func ProcessMultimodalMessages(messages []Message, authToken string) ([]UpstreamMessage, []map[string]interface{}, error) {
+func ProcessMultimodalMessages(messages []types.Message, authToken string) ([]types.UpstreamMessage, []map[string]interface{}, error) {
 	uploader := NewImageUploader(authToken)
-	var processedMessages []UpstreamMessage
+	processor := utils.NewMultimodalProcessor("")
+	processor.EnableDebugLog = appConfig.DebugMode
+	
+	var processedMessages []types.UpstreamMessage
 	var files []map[string]interface{}
 
 	for _, msg := range messages {
-		// 处理字符串内容
-		if content, ok := msg.Content.(string); ok {
-			processedMessages = append(processedMessages, UpstreamMessage{
-				Role:             normalizeRole(msg.Role),
-				Content:          content,
-				ReasoningContent: msg.ReasoningContent,
-			})
-			continue
-		}
-
-		// 处理多模态内容
-		if contentParts, ok := msg.Content.([]interface{}); ok {
-			var textContent strings.Builder
-
-			for _, part := range contentParts {
-				partMap, ok := part.(map[string]interface{})
-				if !ok {
+		// 使用统一处理器处理内容
+		result, err := processor.ProcessContent(msg.Content)
+		
+		var textContent string
+		if err == nil {
+			textContent = result.Text
+			
+			// 处理图片上传
+			for _, imageURL := range result.Images {
+				var fileID string
+				var uploadErr error
+				
+				if strings.HasPrefix(imageURL, "data:image/") {
+					fileID, uploadErr = uploader.UploadBase64Image(imageURL)
+				} else if strings.HasPrefix(imageURL, "http") {
+					fileID, uploadErr = uploader.UploadImageFromURL(imageURL)
+				} else {
+					debugLog("不支持的图片URL格式: %s", imageURL)
 					continue
 				}
-
-				partType, _ := partMap["type"].(string)
-
-				switch partType {
-				case "text":
-					if text, ok := partMap["text"].(string); ok {
-						textContent.WriteString(text)
-						textContent.WriteString(" ")
-					}
-
-				case "image_url":
-					if imageURLMap, ok := partMap["image_url"].(map[string]interface{}); ok {
-						if url, ok := imageURLMap["url"].(string); ok {
-							// 处理 base64 图片
-							if strings.HasPrefix(url, "data:image/") {
-								fileID, err := uploader.UploadBase64Image(url)
-								if err != nil {
-									debugLog("上传 base64 图片失败: %v", err)
-									continue
-								}
-								files = append(files, map[string]interface{}{
-									"type": "image",
-									"id":   fileID,
-								})
-							} else if strings.HasPrefix(url, "http") {
-								// 处理网络图片
-								fileID, err := uploader.UploadImageFromURL(url)
-								if err != nil {
-									debugLog("上传网络图片失败: %v", err)
-									continue
-								}
-								files = append(files, map[string]interface{}{
-									"type": "image",
-									"id":   fileID,
-								})
-							}
-						}
-					}
+				
+				if uploadErr != nil {
+					debugLog("上传图片失败: %v", uploadErr)
+					continue
 				}
+				
+				files = append(files, map[string]interface{}{
+					"type": "image",
+					"id":   fileID,
+				})
 			}
-
-			processedMessages = append(processedMessages, UpstreamMessage{
-				Role:             normalizeRole(msg.Role),
-				Content:          textContent.String(),
-				ReasoningContent: msg.ReasoningContent,
-			})
-		}
-
-		// 处理 ContentPart 数组（已有的格式）
-		if contentParts, ok := msg.Content.([]ContentPart); ok {
-			textContent := processMultimodalContent(contentParts, "")
-
-			// 处理图片
-			for _, part := range contentParts {
-				if part.Type == "image_url" && part.ImageURL != nil {
-					url := part.ImageURL.URL
-
-					if strings.HasPrefix(url, "data:image/") {
-						fileID, err := uploader.UploadBase64Image(url)
-						if err != nil {
-							debugLog("上传 base64 图片失败: %v", err)
-							continue
-						}
-						files = append(files, map[string]interface{}{
-							"type": "image",
-							"id":   fileID,
-						})
-					} else if strings.HasPrefix(url, "http") {
-						fileID, err := uploader.UploadImageFromURL(url)
-						if err != nil {
-							debugLog("上传网络图片失败: %v", err)
-							continue
-						}
-						files = append(files, map[string]interface{}{
-							"type": "image",
-							"id":   fileID,
-						})
-					}
+			
+			// 处理其他媒体文件（如果需要支持视频、文档等）
+			for _, file := range result.Files {
+				if file.FileID != "" {
+					// 如果已有FileID，直接使用
+					files = append(files, map[string]interface{}{
+						"type": file.Type,
+						"id":   file.FileID,
+					})
 				}
+				// 注意：这里可以扩展支持其他文件类型的上传
 			}
-
-			processedMessages = append(processedMessages, UpstreamMessage{
-				Role:             normalizeRole(msg.Role),
-				Content:          textContent,
-				ReasoningContent: msg.ReasoningContent,
-			})
+		} else {
+			// 如果处理失败，尝试将内容转换为字符串
+			if content, ok := msg.Content.(string); ok {
+				textContent = content
+			} else {
+				textContent = ""
+			}
 		}
+		
+		// 创建上游消息
+		processedMessages = append(processedMessages, types.UpstreamMessage{
+			Role:             normalizeRole(msg.Role),
+			Content:          textContent,
+			ReasoningContent: msg.ReasoningContent,
+		})
 	}
 
 	return processedMessages, files, nil

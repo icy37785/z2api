@@ -20,3 +20,14 @@ const (
 	StatusServiceUnavailable  = 503
 	StatusGatewayTimeout      = 504
 )
+
+// 请求限制常量
+const (
+	// 请求限制
+	MaxMessagesPerRequest = 100
+	MaxContentLength      = 500000
+	DefaultMaxTokens      = 10 * 1024 * 1024
+
+	// 端口配置
+	DefaultPort = "8080"
+)

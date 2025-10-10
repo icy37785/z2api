@@ -10,6 +10,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"z2api/config"
 	"z2api/internal/mapper"
+	"z2api/types"
+	"z2api/utils"
 )
 
 // GinHandleChatCompletions 充分利用 Gin 特性的处理器
@@ -27,47 +29,28 @@ func GinHandleChatCompletions(c *gin.Context) {
 
 	// 并发控制 - 在中间件中已处理，这里跳过
 
-	// API Key 验证 - 使用 Gin 方式
+	// API Key 验证 - 使用 utils 统一错误处理
 	authHeader := c.GetHeader("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		c.AbortWithStatusJSON(StatusUnauthorized, gin.H{
-			"error": gin.H{
-				"message": "Missing or invalid Authorization header",
-				"type":    "invalid_request_error",
-				"code":    401,
-				"param":   "authorization",
-			},
-		})
+		utils.ErrorResponse(c, StatusUnauthorized, "invalid_request_error",
+			"Missing or invalid Authorization header", "authorization")
 		recordError(c, startTime, StatusUnauthorized, "invalid_api_key")
 		return
 	}
 
 	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
 	if apiKey != appConfig.DefaultKey {
-		c.AbortWithStatusJSON(StatusUnauthorized, gin.H{
-			"error": gin.H{
-				"message": "Invalid API key provided",
-				"type":    "invalid_request_error",
-				"code":    401,
-				"param":   "api_key",
-			},
-		})
+		utils.ErrorResponse(c, StatusUnauthorized, "invalid_request_error",
+			"Invalid API key provided", "api_key")
 		recordError(c, startTime, StatusUnauthorized, "invalid_api_key")
 		return
 	}
 
 	// 使用 Gin 的 JSON 绑定 - 自动解析和验证
-	var req OpenAIRequest
+	var req types.OpenAIRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.AbortWithStatusJSON(StatusBadRequest, gin.H{
-			"error": gin.H{
-				"message": "Invalid JSON format",
-				"type":    "invalid_request_error",
-				"code":    400,
-				"param":   nil,
-				"details": err.Error(),
-			},
-		})
+		utils.ErrorResponseWithDetails(c, StatusBadRequest, "invalid_request_error",
+			"Invalid JSON format", nil, err.Error())
 		recordError(c, startTime, StatusBadRequest, "invalid_request_error")
 		return
 	}
@@ -79,14 +62,8 @@ func GinHandleChatCompletions(c *gin.Context) {
 
 	// 验证输入
 	if err := validateAndSanitizeInput(&req); err != nil {
-		c.AbortWithStatusJSON(StatusBadRequest, gin.H{
-			"error": gin.H{
-				"message": err.Error(),
-				"type":    "invalid_request_error",
-				"code":    400,
-				"param":   nil,
-			},
-		})
+		utils.ErrorResponse(c, StatusBadRequest, "invalid_request_error",
+			err.Error(), nil)
 		recordError(c, startTime, StatusBadRequest, "invalid_request_error")
 		return
 	}
@@ -100,10 +77,9 @@ func GinHandleChatCompletions(c *gin.Context) {
 	// 存储到上下文
 	c.Set("session_id", sessionID)
 
-	// 生成会话相关ID
-	now := time.Now()
-	chatID := fmt.Sprintf("%d-%d", now.UnixNano(), now.Unix())
-	msgID := fmt.Sprintf("%d", now.UnixNano())
+	// 生成会话相关ID - 使用utils工具函数
+	chatID := utils.GenerateChatID()
+	msgID := utils.GenerateMessageID()
 
 	// 获取模型配置
 	modelConfig := mapper.GetSimpleModelConfig(req.Model)
@@ -124,21 +100,15 @@ func GinHandleChatCompletions(c *gin.Context) {
 }
 
 // handleStreamResponseGin 使用 Gin 的流式响应处理
-func handleStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, sessionID string) {
+func handleStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamRequest, chatID string, authToken string, modelName string, sessionID string) {
 	startTime := c.GetTime("start_time")
 	debugLog("开始处理流式响应 (Gin版) (chat_id=%s, model=%s)", chatID, upstreamReq.Model)
 
 	// 调用上游API
 	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
 	if err != nil {
-		c.AbortWithStatusJSON(StatusBadGateway, gin.H{
-			"error": gin.H{
-				"message": "Failed to call upstream after retries",
-				"type":    "upstream_error",
-				"code":    502,
-				"details": err.Error(),
-			},
-		})
+		utils.ErrorResponseWithDetails(c, StatusBadGateway, "upstream_error",
+			"Failed to call upstream after retries", nil, err.Error())
 		recordError(c, startTime, StatusBadGateway, "upstream_error")
 		return
 	}
@@ -150,35 +120,26 @@ func handleStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, chatID
 	// 检查响应状态
 	if resp.StatusCode != StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		c.AbortWithStatusJSON(StatusBadGateway, gin.H{
-			"error": gin.H{
-				"message": "Upstream error",
-				"type":    "upstream_error",
-				"code":    502,
-				"details": fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body)),
-			},
-		})
+		utils.ErrorResponseWithDetails(c, StatusBadGateway, "upstream_error",
+			"Upstream error", nil, fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body)))
 		recordError(c, startTime, StatusBadGateway, "upstream_error")
 		return
 	}
 
 	// 发送初始块
-	firstChunk := OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+	firstChunk := types.OpenAIResponse{
+		ID:      utils.GenerateChatCompletionID(),
 		Object:  "chat.completion.chunk",
 		Created: time.Now().Unix(),
 		Model:   modelName,
-		Choices: []Choice{{
+		Choices: []types.Choice{{
 			Index: 0,
-			Delta: Delta{Role: "assistant"},
+			Delta: types.Delta{Role: "assistant"},
 		}},
 	}
 
 	// 设置 SSE 响应头
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no") // 禁用 Nginx 缓冲
+	SetSSEHeaders(c)
 
 	// 写入第一个块
 	if data, err := sonicStream.Marshal(firstChunk); err == nil {
@@ -197,7 +158,7 @@ func handleStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, chatID
 }
 
 // handleNonStreamResponseGin 使用 Gin 的非流式响应处理
-func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, sessionID string) {
+func handleNonStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamRequest, chatID string, authToken string, modelName string, sessionID string) {
 	startTime := c.GetTime("start_time")
 	debugLog("开始处理非流式响应 (Gin版) (chat_id=%s, model=%s)", chatID, upstreamReq.Model)
 
@@ -206,14 +167,8 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 
 	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
 	if err != nil {
-		c.AbortWithStatusJSON(StatusBadGateway, gin.H{
-			"error": gin.H{
-				"message": "Failed to call upstream",
-				"type":    "upstream_error",
-				"code":    502,
-				"details": err.Error(),
-			},
-		})
+		utils.ErrorResponseWithDetails(c, StatusBadGateway, "upstream_error",
+			"Failed to call upstream", nil, err.Error())
 		recordError(c, startTime, StatusBadGateway, "upstream_error")
 		return
 	}
@@ -224,14 +179,8 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 
 	if resp.StatusCode != StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		c.AbortWithStatusJSON(StatusBadGateway, gin.H{
-			"error": gin.H{
-				"message": "Upstream error",
-				"type":    "upstream_error",
-				"code":    502,
-				"details": fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body)),
-			},
-		})
+		utils.ErrorResponseWithDetails(c, StatusBadGateway, "upstream_error",
+			"Upstream error", nil, fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body)))
 		recordError(c, startTime, StatusBadGateway, "upstream_error")
 		return
 	}
@@ -271,14 +220,8 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 		// 检查大小限制
 		if totalSize > MaxResponseSize {
 			debugLog("响应大小超出限制")
-			c.AbortWithStatusJSON(StatusInternalServerError, gin.H{
-				"error": gin.H{
-					"message": "Response size exceeded limit",
-					"type":    "aggregation_error",
-					"code":    500,
-					"param":   "response_size",
-				},
-			})
+			utils.ErrorResponse(c, StatusInternalServerError, "aggregation_error",
+				"Response size exceeded limit", "response_size")
 			return
 		}
 
@@ -290,14 +233,8 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 
 	// 检查错误
 	if aggregator.Error != nil {
-		c.AbortWithStatusJSON(StatusInternalServerError, gin.H{
-			"error": gin.H{
-				"message": aggregator.ErrorDetail,
-				"type":    "aggregation_error",
-				"code":    500,
-				"param":   nil,
-			},
-		})
+		utils.ErrorResponse(c, StatusInternalServerError, "aggregation_error",
+			aggregator.ErrorDetail, nil)
 		recordError(c, startTime, StatusInternalServerError, "aggregation_error")
 		return
 	}
@@ -362,29 +299,26 @@ func GinHandleHealth(c *gin.Context) {
 
 // 辅助函数
 
-func setDefaultParams(req *OpenAIRequest) {
+func setDefaultParams(req *types.OpenAIRequest) {
 	if req.Temperature == nil {
-		defaultTemp := 0.7
-		req.Temperature = &defaultTemp
+		req.Temperature = types.Float64Ptr(0.7)
 	}
 	if req.TopP == nil {
-		defaultTopP := 0.9
-		req.TopP = &defaultTopP
+		req.TopP = types.Float64Ptr(0.9)
 	}
 	if req.MaxTokens == nil {
-		defaultMaxTokens := 120000
-		req.MaxTokens = &defaultMaxTokens
+		req.MaxTokens = types.IntPtr(120000)
 	}
 }
 
-func buildUpstreamRequest(req OpenAIRequest, chatID, msgID string, modelConfig config.ModelConfig) UpstreamRequest {
+func buildUpstreamRequest(req types.OpenAIRequest, chatID, msgID string, modelConfig config.ModelConfig) types.UpstreamRequest{
 	featureConfig := getModelFeatures(modelConfig.ID, req.Stream)
 	featureConfig = mergeWithModelConfig(featureConfig, modelConfig)
 
 	converted := convertMultimodalMessages(req.Messages)
 	req.ToolChoiceObject = parseToolChoice(req.ToolChoice)
 
-	upstreamReq := UpstreamRequest{
+	upstreamReq := types.UpstreamRequest{
 		Stream:          true,
 		ChatID:          chatID,
 		ID:              msgID,
@@ -430,13 +364,13 @@ func getAuthToken() string {
 	return authToken
 }
 
-func buildNonStreamResponse(content, reasoningContent string, toolCalls []ToolCall, usage *Usage, modelName string) OpenAIResponse {
+func buildNonStreamResponse(content, reasoningContent string, toolCalls []types.ToolCall, usage *types.Usage, modelName string) types.OpenAIResponse{
 	finishReason := "stop"
 	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
 	}
 
-	message := Message{
+	message := types.Message{
 		Role:    "assistant",
 		Content: content,
 	}
@@ -449,12 +383,12 @@ func buildNonStreamResponse(content, reasoningContent string, toolCalls []ToolCa
 		message.ToolCalls = normalizeToolCalls(toolCalls)
 	}
 
-	resp := OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+	resp := types.OpenAIResponse{
+		ID:      utils.GenerateChatCompletionID(),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   modelName,
-		Choices: []Choice{{
+		Choices: []types.Choice{{
 			Index:        0,
 			Message:      message,
 			FinishReason: finishReason,
