@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -84,46 +83,6 @@ var (
 			return decoder.NewStreamDecoder(nil)
 		},
 	}
-
-/*
-// 标准解码器池 - 已弃用，不再使用
-// 保留定义以避免破坏其他代码，但不再从池中获取解码器
-
-	decoderPool = sync.Pool{
-		New: func() interface{} {
-			// 返回 nil，因为我们不再使用池化的解码器
-			// 直接使用 sonic 的 Unmarshal 方法更高效且避免了类型断言问题
-			return nil
-		},
-	}
-
-// 编码器池 - 直接存储配置，使用时创建编码器
-
-	encoderPool = sync.Pool{
-		New: func() interface{} {
-			buf := bytes.NewBuffer(make([]byte, 0, 4096))
-			return sonicDefault.NewEncoder(buf)
-		},
-	}
-
-// 快速编码器池 - 用于高性能场景
-
-	fastEncoderPool = sync.Pool{
-		New: func() interface{} {
-			buf := bytes.NewBuffer(make([]byte, 0, 4096))
-			return sonicFast.NewEncoder(buf)
-		},
-	}
-
-// 流式编码器池 - 用于SSE响应
-
-	streamEncoderPool = sync.Pool{
-		New: func() interface{} {
-			buf := bytes.NewBuffer(make([]byte, 0, 4096))
-			return sonicStream.NewEncoder(buf)
-		},
-	}
-*/
 )
 
 // Config 配置结构体
@@ -345,19 +304,7 @@ var (
 	summaryRegex      = regexp.MustCompile(`(?s)<summary>.*?</summary>`)
 	detailsRegex      = regexp.MustCompile(`<details[^>]*>`)
 	detailsCloseRegex = regexp.MustCompile(`(?i)\s*</details\s*>`)
-	// 工具调用相关的正则表达式
-	glmBlockRegex = regexp.MustCompile(`(?s)<glm_block\b[^>]*>(.*?)(?:</glm_block>|$)`)
-	/*
-		// 预编译的键值对提取正则表达式
-		stringPattern = regexp.MustCompile(`"([^"]+)":\s*"([^"]*)"`)
-		numberPattern = regexp.MustCompile(`"([^"]+)":\s*(\d+)`)
-		boolPattern   = regexp.MustCompile(`"([^"]+)":\s*(true|false)`)
 
-		// 预编译的工具调用提取正则表达式
-		idRegex   = regexp.MustCompile(`"id"\s*:\s*"([^"]*)"`)
-		nameRegex = regexp.MustCompile(`"name"\s*:\s*"([^"]*)"`)
-		argsRegex = regexp.MustCompile(`"arguments"\s*:\s*"((?:\\.|[^"])*)"`)
-	*/
 	// 字符串替换器
 	thinkingReplacer = strings.NewReplacer(
 		"</thinking>", "",
@@ -1392,24 +1339,6 @@ func (sm *StatsManager) GetStats() *RequestStats {
 }
 
 // getClientIP 获取客户端IP
-func getClientIP(r *http.Request) string {
-	xForwardedFor := r.Header.Get("X-Forwarded-For")
-	if xForwardedFor != "" {
-		ips := strings.Split(xForwardedFor, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
-		}
-	}
-
-	xRealIP := r.Header.Get("X-Real-IP")
-	if xRealIP != "" {
-		return xRealIP
-	}
-
-	// Extract IP from remote address
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
 
 // validateAndSanitizeInput 验证和清理输入数据，支持基于模型的动态验证
 func validateAndSanitizeInput(req *OpenAIRequest) error {
@@ -1451,11 +1380,6 @@ func validateAndSanitizeInput(req *OpenAIRequest) error {
 			return fmt.Errorf("单条消息工具调用数量过多，最多支持10个")
 		}
 	}
-
-	// 验证总内容长度
-	//if totalContentLength > 1000000 { // 总内容最大1M
-	//	return fmt.Errorf("总消息内容过长，最大支持1M")
-	//}
 
 	// 验证数值参数
 	if req.Temperature != nil {
@@ -1518,123 +1442,6 @@ type ErrorDetail struct {
 	Code    int    `json:"code"`
 	Debug   string `json:"debug,omitempty"` // 仅在调试模式下显示
 }
-
-// ErrorHandler 统一错误处理器，提供一致的错误处理机制
-type ErrorHandler struct {
-	debugMode bool
-}
-
-// NewErrorHandler 创建新的错误处理器
-func NewErrorHandler(debugMode bool) *ErrorHandler {
-	return &ErrorHandler{debugMode: debugMode}
-}
-
-// HandleAPIError 处理API格式的错误响应，统一错误格式和日志记录
-// 优化：使用 sonic 编码错误响应
-func (eh *ErrorHandler) HandleAPIError(w http.ResponseWriter, statusCode int, errorType string, message string, logMsg string, args ...interface{}) {
-	// 统一日志记录
-	if logMsg != "" {
-		debugLog(logMsg, args...)
-	}
-
-	// 设置CORS头，确保错误响应也符合CORS要求
-	setCORSHeaders(w)
-
-	errorDetail := ErrorDetail{
-		Message: message,
-		Type:    errorType,
-		Code:    statusCode,
-	}
-
-	// 仅在调试模式下添加调试信息
-	if eh.debugMode && logMsg != "" {
-		errorDetail.Debug = fmt.Sprintf(logMsg, args...)
-	}
-
-	errorResponse := ErrorResponse{
-		Error: errorDetail,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-
-	// 使用 sonic 快速配置进行序列化
-	if data, err := sonicFast.Marshal(errorResponse); err != nil {
-		debugLog("编码错误响应失败: %v", err)
-		http.Error(w, message, statusCode)
-	} else if _, err := w.Write(data); err != nil {
-		debugLog("写入错误响应失败: %v", err)
-	}
-}
-
-// HandleUpstreamError 统一处理上游错误响应
-// 优化：使用 sonic 编码错误响应
-func (eh *ErrorHandler) HandleUpstreamError(w http.ResponseWriter, err *UpstreamError) {
-	setCORSHeaders(w)
-
-	errorDetail := ErrorDetail{
-		Message: err.Detail,
-		Type:    "upstream_error",
-		Code:    err.Code,
-	}
-
-	// 仅在调试模式下添加调试信息
-	if eh.debugMode {
-		errorDetail.Debug = err.Detail
-	}
-
-	errorResponse := ErrorResponse{
-		Error: errorDetail,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadGateway)
-
-	// 使用 sonic 快速配置进行序列化
-	if data, encodeErr := sonicFast.Marshal(errorResponse); encodeErr != nil {
-		debugLog("编码上游错误响应失败: %v", encodeErr)
-		http.Error(w, err.Detail, http.StatusBadGateway)
-	} else if _, writeErr := w.Write(data); writeErr != nil {
-		debugLog("写入上游错误响应失败: %v", writeErr)
-	}
-}
-
-// HandleStreamError 处理流式响应中的错误
-func (eh *ErrorHandler) HandleStreamError(w http.ResponseWriter, flusher http.Flusher, model string, errMsg string) {
-	errorChunk := OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
-		Model:   model,
-		Choices: []Choice{
-			{
-				Index:        0,
-				Delta:        Delta{Content: ""},
-				FinishReason: "error",
-			},
-		},
-	}
-	writeSSEChunk(w, errorChunk)
-	flusher.Flush()
-
-	// 发送[DONE]信号
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-
-	debugLog("流式错误响应已发送: %s", errMsg)
-}
-
-// RecoverFromPanic 恢复panic并返回适当的错误响应
-func (eh *ErrorHandler) RecoverFromPanic(w http.ResponseWriter, r *http.Request) {
-	if r := recover(); r != nil {
-		debugLog("捕获到panic: %v", r)
-		eh.HandleAPIError(w, http.StatusInternalServerError, "internal_server_error",
-			"Internal server error", "服务内部错误: %v", r)
-	}
-}
-
-// 全局错误处理器实例
-var globalErrorHandler *ErrorHandler
 
 // 获取匿名token（每次对话使用不同token，避免共享记忆）
 // GetToken 从缓存或新获取Token，使用 singleflight 防止缓存击穿
@@ -1817,7 +1624,7 @@ func getAnonymousTokenDirect() (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != StatusOK {
 		return "", fmt.Errorf("anon token status=%d", resp.StatusCode)
 	}
 	var body struct {
@@ -1977,7 +1784,6 @@ func main() {
 	router := setupRouter()
 
 	// 初始化全局错误处理器
-	globalErrorHandler = NewErrorHandler(appConfig.DebugMode)
 
 	log.Printf("OpenAI兼容API服务器启动在端口%s", appConfig.Port)
 	log.Printf("模型: %s", DefaultModelName)
@@ -2027,181 +1833,8 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
-// handleDashboard handles the dashboard page
-func handleDashboard(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, dashboardHTML)
-}
-
-// handleDashboardStats handles the dashboard stats endpoint
-// 优化：使用 sonic 编码统计响应
-func handleDashboardStats(w http.ResponseWriter, r *http.Request) {
-	// 检查 stats 是否已初始化，防止在测试环境中出现空指针错误
-	if stats == nil {
-		http.Error(w, "Stats not initialized", http.StatusInternalServerError)
-		return
-	}
-
-	stats.mutex.RLock()
-	defer stats.mutex.RUnlock()
-
-	// 创建统计管理器实例
-	statsManager := NewStatsManager()
-	// Get top 3 models
-	topModels := statsManager.GetTopModels()
-
-	// Create a serializable stats response
-	statsResponse := map[string]interface{}{
-		"totalRequests":        stats.TotalRequests,
-		"successfulRequests":   stats.SuccessfulRequests,
-		"failedRequests":       stats.FailedRequests,
-		"lastRequestTime":      stats.LastRequestTime,
-		"averageResponseTime":  stats.AverageResponseTime,
-		"homePageViews":        stats.HomePageViews,
-		"apiCallsCount":        stats.ApiCallsCount,
-		"modelsCallsCount":     stats.ModelsCallsCount,
-		"streamingRequests":    stats.StreamingRequests,
-		"nonStreamingRequests": stats.NonStreamingRequests,
-		"totalTokensUsed":      stats.TotalTokensUsed,
-		"startTime":            stats.StartTime,
-		"fastestResponse":      stats.FastestResponse,
-		"slowestResponse":      stats.SlowestResponse,
-		"topModels":            topModels,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	// 使用 sonic 兼容配置进行序列化（外部API响应）
-	if data, err := sonicCompatible.Marshal(statsResponse); err != nil {
-		debugLog("编码统计响应失败: %v", err)
-		http.Error(w, "Failed to encode stats", http.StatusInternalServerError)
-	} else if _, err := w.Write(data); err != nil {
-		debugLog("写入统计响应失败: %v", err)
-	}
-}
-
-// handleDashboardRequests handles the dashboard live requests endpoint
-// 优化：使用 sonic 编码实时请求响应
-func handleDashboardRequests(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	liveRequestsMutex.RLock()
-	// Create a copy of the slice to avoid holding the lock while encoding
-	requests := make([]LiveRequest, len(liveRequests))
-	copy(requests, liveRequests)
-	liveRequestsMutex.RUnlock()
-
-	// Reverse the slice so the newest requests are first
-	for i, j := 0, len(requests)-1; i < j; i, j = i+1, j-1 {
-		requests[i], requests[j] = requests[j], requests[i]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	// 使用 sonic 兼容配置进行序列化
-	if data, err := sonicCompatible.Marshal(requests); err != nil {
-		debugLog("Failed to encode live requests: %v", err)
-		http.Error(w, "Failed to encode requests", http.StatusInternalServerError)
-	} else if _, err := w.Write(data); err != nil {
-		debugLog("Failed to write live requests: %v", err)
-	}
-}
-
-func handleOptions(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	// Track home page views
-	if r.URL.Path == "/" {
-		// 检查 stats 是否已初始化，防止在测试环境中出现空指针错误
-		if stats != nil {
-			stats.mutex.Lock()
-			stats.HomePageViews++
-			stats.mutex.Unlock()
-		}
-		fmt.Fprintf(w, "<h1>ZtoApi</h1><p>OpenAI compatible API for Z.ai.</p>")
-		return
-	}
-	w.WriteHeader(http.StatusNotFound)
-}
-
 // handleHealth 健康检查端点
 // 优化：使用 sonic 编码健康检查响应
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// 检查上游服务可用性（简化版）
-	status := "healthy"
-	statusCode := http.StatusOK
-
-	// 可以添加更多检查项，如数据库连接、上游API可用性等
-
-	healthResponse := map[string]interface{}{
-		"status":    status,
-		"timestamp": time.Now().Unix(),
-		"version":   "1.0.0",
-		"config": map[string]interface{}{
-			"debug_mode":              appConfig.DebugMode,
-			"think_tags_mode":         appConfig.ThinkTagsMode,
-			"anon_token_enabled":      appConfig.AnonTokenEnabled,
-			"max_concurrent_requests": appConfig.MaxConcurrentRequests,
-		},
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	// 使用 sonic 兼容配置进行序列化
-	if data, err := sonicCompatible.Marshal(healthResponse); err != nil {
-		debugLog("编码健康检查响应失败: %v", err)
-		http.Error(w, "Failed to encode health", http.StatusInternalServerError)
-	} else if _, err := w.Write(data); err != nil {
-		debugLog("写入健康检查响应失败: %v", err)
-	}
-}
-
-func setCORSHeaders(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-	// 移除 Access-Control-Allow-Credentials 以与 * origin 兼容
-}
-
-// handleModels 处理模型列表请求
-// 优化：使用 sonic 编码模型列表响应
-func handleModels(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
-	userAgent := r.Header.Get("User-Agent")
-
-	setCORSHeaders(w)
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// 优雅降级: 如果上游服务不可用，仍返回基本模型列表
-	response := getModelsList()
-
-	w.Header().Set("Content-Type", "application/json")
-	// 使用 sonic 兼容配置进行序列化（外部API响应）
-	if data, err := sonicCompatible.Marshal(response); err != nil {
-		debugLog("编码模型列表响应失败: %v", err)
-		http.Error(w, "Failed to encode models", http.StatusInternalServerError)
-	} else if _, err := w.Write(data); err != nil {
-		debugLog("写入模型列表响应失败: %v", err)
-	}
-
-	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-	recordRequestStats(startTime, r.URL.Path, http.StatusOK, 0, "", false)
-	addLiveRequest(r.Method, r.URL.Path, http.StatusOK, duration, userAgent, "")
-}
 
 // getModelsList 获取模型列表，支持优雅降级
 func getModelsList() ModelsResponse {
@@ -2224,7 +1857,6 @@ func getModelsList() ModelsResponse {
 		Data:   apiModels,
 	}
 }
-
 
 // callUpstreamWithHeaders 调用上游API
 // 优化：使用 sonic 对象池进行序列化
@@ -2447,22 +2079,22 @@ func isRetryableError(err error, statusCode int, responseBody []byte) bool {
 
 	// 检查HTTP状态码
 	switch statusCode {
-	case http.StatusUnauthorized: // 401
+	case StatusUnauthorized: // 401
 		debugLog("401错误，需要重新认证，可重试")
 		return true
-	case http.StatusTooManyRequests: // 429
+	case StatusTooManyRequests: // 429
 		debugLog("429限流错误，可重试")
 		return true
-	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout: // 502, 503, 504
+	case StatusBadGateway, StatusServiceUnavailable, StatusGatewayTimeout: // 502, 503, 504
 		debugLog("网关错误 %d，可重试", statusCode)
 		return true
-	case http.StatusInternalServerError: // 500
+	case StatusInternalServerError: // 500
 		debugLog("500服务器内部错误，可重试")
 		return true
-	case http.StatusRequestTimeout: // 408
+	case StatusRequestTimeout: // 408
 		debugLog("408请求超时，可重试")
 		return true
-	case http.StatusBadRequest: // 400
+	case StatusBadRequest: // 400
 		// 检查特殊的400错误情况
 		if len(responseBody) > 0 {
 			bodyStr := string(responseBody)
@@ -2561,7 +2193,7 @@ func callUpstreamWithRetry(upstreamReq UpstreamRequest, chatID string, authToken
 		if resp != nil {
 			// 读取一些响应体用于错误分析（如果需要）
 			var bodyBytes []byte
-			if resp.StatusCode != http.StatusOK {
+			if resp.StatusCode != StatusOK {
 				// 尝试读取响应体用于错误分析
 				bodyBytes, _ = io.ReadAll(io.LimitReader(resp.Body, 1024)) // 最多读1KB用于分析
 				// 重新包装响应体，以便后续处理
@@ -2569,7 +2201,7 @@ func callUpstreamWithRetry(upstreamReq UpstreamRequest, chatID string, authToken
 			}
 
 			// 检查状态码
-			if resp.StatusCode == http.StatusOK {
+			if resp.StatusCode == StatusOK {
 				debugLog("上游调用成功 (尝试 %d/%d): %d", attempt+1, maxRetries, resp.StatusCode)
 				return resp, cancel, nil // 成功，直接返回
 			}
@@ -2579,7 +2211,7 @@ func callUpstreamWithRetry(upstreamReq UpstreamRequest, chatID string, authToken
 				debugLog("收到可重试的HTTP状态码 %d (尝试 %d/%d)", resp.StatusCode, attempt+1, maxRetries)
 
 				// 特殊处理401错误
-				if resp.StatusCode == http.StatusUnauthorized {
+				if resp.StatusCode == StatusUnauthorized {
 					debugLog("收到401错误，尝试刷新token和重新生成签名")
 					// 标记token为失效
 					if tokenCache != nil {
@@ -2603,7 +2235,7 @@ func callUpstreamWithRetry(upstreamReq UpstreamRequest, chatID string, authToken
 				// 如果不是最后一次尝试，等待后重试
 				if attempt < maxRetries-1 {
 					// 对于429限流，使用更长的基础延迟
-					if resp.StatusCode == http.StatusTooManyRequests {
+					if resp.StatusCode == StatusTooManyRequests {
 						delay := calculateBackoffDelay(attempt, 1*time.Second, 180*time.Second)
 						debugLog("限流错误，等待 %v 后重试", delay)
 						time.Sleep(delay)
@@ -2696,792 +2328,4 @@ func fixUnclosedThinkTags(content string) string {
 	}
 
 	return content
-}
-
-// writeSSEChunk 写入SSE块到响应流
-// 优化：使用 sonic 流式配置进行高效序列化
-func writeSSEChunk(w http.ResponseWriter, chunk OpenAIResponse) {
-	// 使用 sonic 流式配置直接编码
-	data, err := sonicStream.Marshal(chunk)
-	if err != nil {
-		debugLog("编码SSE块失败: %v", err)
-		return
-	}
-
-	// 写入SSE格式 - 确保有正确的格式
-	fmt.Fprintf(w, "data: %s\n\n", string(data)) // 添加双换行符以符合SSE规范
-}
-
-// handleNonStreamResponseWithIDs 处理非流式响应
-// 优化：使用 sonic 解码器池处理响应
-func handleNonStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time, sessionID string) {
-	userAgent := r.Header.Get("User-Agent")
-	debugLog("开始处理非流式响应 (chat_id=%s, model=%s) - 内部使用流式请求并聚合", chatID, upstreamReq.Model)
-
-	// 重要修改：将上游请求改为流式（解决Z.ai API返回SSE格式的问题）
-	upstreamReq.Stream = true
-
-	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
-	if err != nil {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadGateway, duration, userAgent, modelName)
-		globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error",
-			"Failed to call upstream", "调用上游失败: %v", err)
-		return
-	}
-	defer func() {
-		cancel()
-		resp.Body.Close()
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadGateway, duration, userAgent, modelName)
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error",
-				"Upstream error", "上游返回错误状态: %d, 读取响应体失败: %v", resp.StatusCode, err)
-		} else {
-			globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error",
-				"Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
-		}
-		return
-	}
-
-	// 流式响应聚合变量
-	var aggregatedContent strings.Builder
-	var aggregatedReasoningContent strings.Builder
-	var aggregatedToolCalls []ToolCall
-	var lastUsage Usage
-	var hasError bool
-	var errorDetail string
-	var totalSize int64
-	lineCount := 0
-
-	// 添加标志变量来跟踪是否已经报告过未闭合标签错误
-	var hasReportedUnclosedThinkTag bool
-	var hasReportedUnclosedDetailsTag bool
-
-	// 创建缓冲读取器处理SSE
-	bufReader := bufio.NewReader(resp.Body)
-	debugLog("开始聚合流式响应为非流式格式")
-
-	// 用于跟踪工具调用
-	toolCallsMap := make(map[int]*ToolCall)
-
-	for {
-		// 检查客户端是否断开
-		select {
-		case <-r.Context().Done():
-			debugLog("客户端断开连接，停止处理")
-			return
-		default:
-		}
-
-		// 读取一行
-		line, err := bufReader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				debugLog("到达流末尾，共处理 %d 行", lineCount)
-				break
-			}
-			debugLog("读取SSE行失败: %v", err)
-			break
-		}
-
-		lineCount++
-		line = strings.TrimSpace(line)
-
-		// 检查累积大小
-		totalSize += int64(len(line))
-		if totalSize > MaxResponseSize {
-			debugLog("响应大小超出限制 (%d > %d)，停止处理", totalSize, MaxResponseSize)
-			hasError = true
-			errorDetail = fmt.Sprintf("响应大小超出限制 (%d bytes)", MaxResponseSize)
-			break
-		}
-
-		// 处理SSE数据行
-		if line == "" || !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		dataStr := strings.TrimPrefix(line, "data: ")
-		dataStr = strings.TrimSpace(dataStr)
-		if dataStr == "" || dataStr == "[DONE]" {
-			if dataStr == "[DONE]" {
-				debugLog("收到[DONE]信号，结束聚合")
-				break
-			}
-			continue
-		}
-
-		// 解析JSON
-		var upstreamData UpstreamData
-		if err := sonicStream.UnmarshalFromString(dataStr, &upstreamData); err != nil {
-			debugLog("SSE数据解析失败 (行 %d): %v", lineCount, err)
-			continue
-		}
-
-		// 处理错误
-		if upstreamData.Error != nil || upstreamData.Data.Error != nil ||
-			(upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
-			errObj := upstreamData.Error
-			if errObj == nil {
-				errObj = upstreamData.Data.Error
-			}
-			if errObj == nil && upstreamData.Data.Inner != nil {
-				errObj = upstreamData.Data.Inner.Error
-			}
-			if errObj != nil {
-				debugLog("上游错误: code=%d, detail=%s", errObj.Code, errObj.Detail)
-				hasError = true
-				errorDetail = errObj.Detail
-
-				// 检查token问题
-				if strings.Contains(errObj.Detail, "Missing signature header") ||
-					strings.Contains(errObj.Detail, "signature") ||
-					errObj.Code == 400 {
-					debugLog("检测到可能的token签名错误，标记token为失效")
-					if tokenCache != nil {
-						tokenCache.InvalidateToken()
-					}
-				}
-				break
-			}
-		}
-
-		// 聚合usage信息
-		if upstreamData.Data.Usage.TotalTokens > 0 {
-			lastUsage = upstreamData.Data.Usage
-		}
-
-		// 根据Phase聚合内容
-		switch upstreamData.Data.Phase {
-		case "thinking":
-			if upstreamData.Data.DeltaContent != "" {
-				rawContent := upstreamData.Data.DeltaContent
-
-				// 仅在首次检测到未闭合的details标签时报告
-				if !hasReportedUnclosedDetailsTag && (strings.Contains(rawContent, "<details") || strings.Contains(rawContent, "</details>")) {
-					detailsOpenCount := strings.Count(rawContent, "<details")
-					detailsCloseCount := strings.Count(rawContent, "</details>")
-
-					// 仅在检测到实际的未闭合标签时记录
-					if detailsOpenCount > detailsCloseCount {
-						debugLog("[RAW_SSE] 首次检测到未闭合的details标签 (行 %d): <details=%d, </details>=%d",
-							lineCount, detailsOpenCount, detailsCloseCount)
-						hasReportedUnclosedDetailsTag = true
-					}
-				}
-
-				// 转换thinking内容
-				transformed := transformThinking(rawContent)
-
-				if transformed != "" {
-					aggregatedReasoningContent.WriteString(transformed)
-
-					// 仅在首次检测到未闭合的think标签时报告
-					if !hasReportedUnclosedThinkTag {
-						afterContent := aggregatedReasoningContent.String()
-						afterThinkOpen := strings.Count(afterContent, "<think>")
-						afterThinkClose := strings.Count(afterContent, "</think>")
-
-						if afterThinkOpen > afterThinkClose {
-							debugLog("[REASONING_ERROR] 首次检测到未闭合的<think>标签: <think>=%d, </think>=%d, 差值=%d",
-								afterThinkOpen, afterThinkClose, afterThinkOpen-afterThinkClose)
-							hasReportedUnclosedThinkTag = true
-						}
-					}
-				}
-			}
-		case "tool_call":
-			// 处理工具调用
-			if len(upstreamData.Data.ToolCalls) > 0 {
-				for _, tc := range upstreamData.Data.ToolCalls {
-					if existing, ok := toolCallsMap[tc.Index]; ok {
-						// 更新现有工具调用
-						if tc.Function.Arguments != "" {
-							existing.Function.Arguments += tc.Function.Arguments
-						}
-					} else {
-						// 新工具调用
-						newTC := tc
-						toolCallsMap[tc.Index] = &newTC
-					}
-				}
-			}
-		case "answer", "done":
-			// 处理answer内容
-			if upstreamData.Data.EditContent != "" {
-				// 处理初始答案
-				content := upstreamData.Data.EditContent
-				parts := detailsCloseRegex.Split(content, -1)
-				if len(parts) > 1 {
-					content = parts[1]
-				}
-				if content != "" {
-					aggregatedContent.WriteString(content)
-				}
-			} else if upstreamData.Data.DeltaContent != "" {
-				aggregatedContent.WriteString(upstreamData.Data.DeltaContent)
-			}
-
-			// 检查是否完成
-			if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
-				debugLog("收到完成信号，结束聚合")
-				break
-			}
-		default:
-			// 其他情况，聚合delta内容
-			if upstreamData.Data.DeltaContent != "" {
-				aggregatedContent.WriteString(upstreamData.Data.DeltaContent)
-			}
-		}
-	}
-
-	// 处理错误情况
-	if hasError {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusInternalServerError, 0, modelName, false)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusInternalServerError, duration, userAgent, modelName)
-		globalErrorHandler.HandleAPIError(w, http.StatusInternalServerError, "stream_aggregation_error",
-			"Failed to aggregate stream response", "流式响应聚合失败: %s", errorDetail)
-		return
-	}
-
-	// 将工具调用map转换为slice
-	for _, tc := range toolCallsMap {
-		aggregatedToolCalls = append(aggregatedToolCalls, *tc)
-	}
-	// 按index排序工具调用
-	sort.Slice(aggregatedToolCalls, func(i, j int) bool {
-		return aggregatedToolCalls[i].Index < aggregatedToolCalls[j].Index
-	})
-
-	// 构建OpenAI格式响应
-	openAIResp := OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-		Object:  "chat.completion",
-		Created: time.Now().Unix(),
-		Model:   modelName,
-		Choices: []Choice{},
-	}
-
-	// 确定完成原因
-	finishReason := "stop"
-	if len(aggregatedToolCalls) > 0 {
-		finishReason = "tool_calls"
-	}
-
-	// 构建消息
-	message := Message{
-		Role:      "assistant",
-		Content:   aggregatedContent.String(),
-		ToolCalls: normalizeToolCalls(aggregatedToolCalls),
-	}
-
-	// 如果有推理内容，添加到消息中
-	if aggregatedReasoningContent.Len() > 0 {
-		finalReasoningContent := aggregatedReasoningContent.String()
-
-		// 修复未闭合的 <think> 标签
-		finalReasoningContent = fixUnclosedThinkTags(finalReasoningContent)
-
-		message.ReasoningContent = finalReasoningContent
-
-		// 简化日志：仅记录关键信息
-		thinkOpenCount := strings.Count(finalReasoningContent, "<think>")
-		thinkCloseCount := strings.Count(finalReasoningContent, "</think>")
-		if thinkOpenCount > thinkCloseCount {
-			debugLog("[REASONING_ERROR] 修复后仍有未闭合标签: <think>=%d, </think>=%d", thinkOpenCount, thinkCloseCount)
-		} else if thinkOpenCount == thinkCloseCount && thinkOpenCount > 0 {
-			debugLog("[REASONING_FIXED] 标签已修复并平衡: <think>=%d, </think>=%d", thinkOpenCount, thinkCloseCount)
-		}
-	}
-
-	openAIResp.Choices = append(openAIResp.Choices, Choice{
-		Index:        0,
-		Message:      message,
-		FinishReason: finishReason,
-	})
-
-	// 添加usage信息
-	if lastUsage.TotalTokens > 0 {
-		openAIResp.Usage = lastUsage
-	}
-
-	// 发送响应
-	setCORSHeaders(w)
-	w.Header().Set("Content-Type", "application/json")
-
-	// 使用sonic编码响应
-	data, err := sonicDefault.Marshal(openAIResp)
-	if err != nil {
-		debugLog("编码响应失败: %v", err)
-		globalErrorHandler.HandleAPIError(w, http.StatusInternalServerError, "encode_error",
-			"Failed to encode response", "编码响应失败: %v", err)
-		return
-	}
-
-	// 验证JSON完整性
-	debugLog("生成的JSON响应大小: %d 字节", len(data))
-	if len(data) > 0 && data[len(data)-1] != '}' {
-		debugLog("警告：JSON响应可能不完整，最后字符是: %c", data[len(data)-1])
-	}
-
-	// 替换原来的 w.Write(data)，添加错误处理
-	n, err := w.Write(data)
-	if err != nil {
-		debugLog("写入响应失败: %v, 已写入: %d/%d 字节", err, n, len(data))
-		return
-	}
-	if n != len(data) {
-		debugLog("警告：响应写入不完整 (%d/%d 字节)", n, len(data))
-		// 尝试写入剩余部分
-		remaining := data[n:]
-		if _, err := w.Write(remaining); err != nil {
-			debugLog("写入剩余部分失败: %v", err)
-		}
-	}
-
-	// 确保flush
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-		debugLog("响应已显式flush")
-	}
-
-	// 记录统计
-	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-	recordRequestStats(startTime, r.URL.Path, http.StatusOK, int64(lastUsage.TotalTokens), modelName, false)
-	addLiveRequest(r.Method, r.URL.Path, http.StatusOK, duration, userAgent, modelName)
-
-	debugLog("非流式响应（通过流式聚合）完成，处理了 %d 行SSE数据，使用tokens: %d",
-		lineCount, lastUsage.TotalTokens)
-}
-
-// handleStreamResponseWithIDs 处理流式响应
-// 优化：使用 sonic 流式解码器处理SSE
-func handleStreamResponseWithIDs(w http.ResponseWriter, r *http.Request, upstreamReq UpstreamRequest, chatID string, authToken string, modelName string, startTime time.Time, sessionID string) {
-	userAgent := r.Header.Get("User-Agent")
-	debugLog("开始处理流式响应 (chat_id=%s, model=%s)", chatID, upstreamReq.Model)
-
-	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
-	if err != nil {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, true)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadGateway, duration, userAgent, modelName)
-		globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error", "Failed to call upstream after retries", "调用上游失败: %v", err)
-		return
-	}
-
-	// 确保在函数结束时取消上下文和关闭响应体
-	defer func() {
-		cancel()          // 取消上下文
-		resp.Body.Close() // 关闭响应体
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusBadGateway, 0, modelName, true)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusBadGateway, duration, userAgent, modelName)
-		if appConfig.DebugMode {
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d, 读取响应体失败: %v", resp.StatusCode, err)
-			} else {
-				globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d, 响应: %s", resp.StatusCode, string(body))
-			}
-		} else {
-			globalErrorHandler.HandleAPIError(w, http.StatusBadGateway, "upstream_error", "Upstream error", "上游返回错误状态: %d", resp.StatusCode)
-		}
-		return
-	}
-
-	setCORSHeaders(w) // 确保流式响应也包含CORS头
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-		recordRequestStats(startTime, r.URL.Path, http.StatusInternalServerError, 0, modelName, true)
-		addLiveRequest(r.Method, r.URL.Path, http.StatusInternalServerError, duration, userAgent, modelName)
-		globalErrorHandler.HandleAPIError(w, http.StatusInternalServerError, "streaming_unsupported", "Streaming not supported by server", "Streaming不受支持")
-		return
-	}
-
-	firstChunk := OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
-		Model:   upstreamReq.Model,
-		Choices: []Choice{
-			{
-				Index: 0,
-				Delta: Delta{Role: "assistant"},
-			},
-		},
-	}
-	writeSSEChunk(w, firstChunk)
-	flusher.Flush()
-
-	debugLog("开始读取上游SSE流")
-
-	// 使用 sonic 流式解码器处理 SSE
-	lineCount := 0
-	var totalSize int64
-	var lastUsage map[string]interface{}
-	var sentInitialAnswer bool
-	var sentFinish bool // 追踪是否已发送结束块
-
-	// 用于跟踪工具调用的状态
-	var toolCalls []ToolCall
-	var inThinkingPhase bool // 跟踪是否处于thinking phase
-
-	// 创建一个缓冲读取器来处理 SSE 格式
-	bufReader := bufio.NewReader(resp.Body)
-
-	// 从池中获取流式解码器
-	streamDec := streamDecoderPool.Get().(*decoder.StreamDecoder)
-	defer streamDecoderPool.Put(streamDec)
-
-	// 保存读取错误，用于循环后的检查
-	var readErr error
-
-	for {
-		// 检查客户端是否断开连接
-		select {
-		case <-r.Context().Done():
-			debugLog("客户端断开连接，停止处理流")
-			return
-		default:
-			// 继续处理
-		}
-
-		// 读取一行数据
-		line, err := bufReader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				debugLog("到达流末尾")
-				break
-			}
-			debugLog("读取SSE行失败: %v", err)
-			readErr = err // 保存错误
-			break
-		}
-
-		// 任务3：在接收原始SSE数据的最早阶段添加日志
-		if strings.HasPrefix(line, "data: ") && strings.Contains(line, "thinking") {
-			// 记录thinking phase的原始数据
-			if strings.Contains(line, "</details") {
-				debugLog("[RAW_SSE_STREAM] 行 %d: 原始数据包含</details标签", lineCount)
-			}
-			if strings.Contains(line, "<details") && !strings.Contains(line, "</details>") {
-				debugLog("[RAW_SSE_STREAM] 警告：行 %d 包含未闭合的<details标签", lineCount)
-			}
-		}
-
-		lineCount++
-		line = strings.TrimSpace(line)
-
-		// 检查累积大小
-		totalSize += int64(len(line))
-		if totalSize > MaxResponseSize {
-			debugLog("流式响应大小超出限制 (%d > %d)，停止处理", totalSize, MaxResponseSize)
-			break
-		}
-
-		// 更健壮的SSE数据行处理
-		if line == "" || !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		dataStr := strings.TrimPrefix(line, "data: ")
-		dataStr = strings.TrimSpace(dataStr)
-		if dataStr == "" || dataStr == "[DONE]" {
-			if dataStr == "[DONE]" {
-				debugLog("收到[DONE]信号，结束流处理")
-				break
-			}
-			continue
-		}
-
-		// 使用 sonic 流式配置解析 JSON
-		var upstreamData UpstreamData
-		if err := sonicStream.UnmarshalFromString(dataStr, &upstreamData); err != nil {
-			debugLog("SSE数据解析失败: %v", err)
-			continue
-		}
-
-		// 处理错误响应
-		if (upstreamData.Error != nil) || (upstreamData.Data.Error != nil) || (upstreamData.Data.Inner != nil && upstreamData.Data.Inner.Error != nil) {
-			errObj := upstreamData.Error
-			if errObj == nil {
-				errObj = upstreamData.Data.Error
-			}
-			if errObj == nil && upstreamData.Data.Inner != nil {
-				errObj = upstreamData.Data.Inner.Error
-			}
-			if errObj != nil {
-				debugLog("上游错误: code=%d, detail=%s", errObj.Code, errObj.Detail)
-
-				// 检查特定错误类型，如签名错误，需要刷新匿名token
-				if strings.Contains(errObj.Detail, "Missing signature header") ||
-					strings.Contains(errObj.Detail, "signature") ||
-					errObj.Code == 400 {
-					debugLog("检测到可能的token签名错误，标记token为失效")
-					if tokenCache != nil {
-						tokenCache.InvalidateToken()
-					}
-				}
-
-				// 向客户端发送错误响应
-				errorChunk := OpenAIResponse{
-					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-					Object:  "chat.completion.chunk",
-					Created: time.Now().Unix(),
-					Model:   upstreamReq.Model,
-					Choices: []Choice{
-						{
-							Index:        0,
-							Delta:        Delta{Content: ""},
-							FinishReason: "error",
-						},
-					},
-				}
-				writeSSEChunk(w, errorChunk)
-				flusher.Flush()
-
-				// 发送[DONE]信号
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-
-				// 记录统计信息
-				duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-				recordRequestStats(startTime, r.URL.Path, 200, 0, modelName, true)
-				addLiveRequest(r.Method, r.URL.Path, 200, duration, userAgent, modelName)
-
-				debugLog("错误处理完成，释放资源")
-				return
-			}
-		}
-
-		// 检查是否需要结束 thinking phase
-		if inThinkingPhase && upstreamData.Data.Phase != "thinking" {
-			debugLog("Thinking phase ended (transition to '%s'). Sending closing </think> tag.", upstreamData.Data.Phase)
-			closingChunk := OpenAIResponse{
-				ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   upstreamReq.Model,
-				Choices: []Choice{
-					{
-						Index: 0,
-						Delta: Delta{ReasoningContent: "</think>"},
-					},
-				},
-			}
-			writeSSEChunk(w, closingChunk)
-			flusher.Flush()
-			inThinkingPhase = false // 重置标志
-		}
-
-		// 保存使用量信息
-		if upstreamData.Data.Usage.TotalTokens > 0 {
-			lastUsage = map[string]interface{}{
-				"prompt_tokens":     upstreamData.Data.Usage.PromptTokens,
-				"completion_tokens": upstreamData.Data.Usage.CompletionTokens,
-				"total_tokens":      upstreamData.Data.Usage.TotalTokens,
-			}
-		}
-
-		// 处理初始答案
-		if !sentInitialAnswer && upstreamData.Data.EditContent != "" && upstreamData.Data.Phase == "answer" {
-			var out = upstreamData.Data.EditContent
-			var parts = detailsCloseRegex.Split(out, -1)
-			var contentToUse string
-			if len(parts) > 1 {
-				contentToUse = parts[1]
-			} else {
-				contentToUse = out
-			}
-			if contentToUse != "" {
-				chunk := OpenAIResponse{
-					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-					Object:  "chat.completion.chunk",
-					Created: time.Now().Unix(),
-					Model:   upstreamReq.Model,
-					Choices: []Choice{
-						{
-							Index: 0,
-							Delta: Delta{Content: contentToUse},
-						},
-					},
-				}
-				writeSSEChunk(w, chunk)
-				flusher.Flush()
-				sentInitialAnswer = true
-			}
-		}
-
-		// 优先按Phase分流处理
-		switch upstreamData.Data.Phase {
-		case "tool_call":
-			// 处理工具调用
-			if len(upstreamData.Data.ToolCalls) > 0 {
-				// 规范化工具调用
-				normalizedCalls := normalizeToolCalls(upstreamData.Data.ToolCalls)
-
-				chunk := OpenAIResponse{
-					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-					Object:  "chat.completion.chunk",
-					Created: time.Now().Unix(),
-					Model:   upstreamReq.Model,
-					Choices: []Choice{
-						{
-							Index: 0,
-							Delta: Delta{
-								Role:      "assistant",
-								ToolCalls: normalizedCalls,
-							},
-						},
-					},
-				}
-				writeSSEChunk(w, chunk)
-				flusher.Flush()
-
-				// 保存工具调用状态
-				toolCalls = append(toolCalls, normalizedCalls...)
-			}
-		case "thinking":
-			if !inThinkingPhase {
-				inThinkingPhase = true
-			}
-			if upstreamData.Data.DeltaContent != "" {
-				out := transformThinking(upstreamData.Data.DeltaContent)
-				if out != "" {
-					chunk := OpenAIResponse{
-						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-						Object:  "chat.completion.chunk",
-						Created: time.Now().Unix(),
-						Model:   upstreamReq.Model,
-						Choices: []Choice{
-							{
-								Index: 0,
-								Delta: Delta{ReasoningContent: out},
-							},
-						},
-					}
-					writeSSEChunk(w, chunk)
-					flusher.Flush()
-				}
-			}
-		default: // 包括 "answer" 和其他情况
-			if upstreamData.Data.DeltaContent != "" {
-				out := upstreamData.Data.DeltaContent
-				if out != "" {
-					chunk := OpenAIResponse{
-						ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-						Object:  "chat.completion.chunk",
-						Created: time.Now().Unix(),
-						Model:   upstreamReq.Model,
-						Choices: []Choice{
-							{
-								Index: 0,
-								Delta: Delta{Content: out},
-							},
-						},
-					}
-					writeSSEChunk(w, chunk)
-					flusher.Flush()
-				}
-			}
-		}
-
-		// 检查是否完成
-		if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
-			// 检查是否有工具调用需要完成
-			if len(toolCalls) > 0 && !sentFinish {
-				// 发送工具调用完成信号
-				endChunk := OpenAIResponse{
-					ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-					Object:  "chat.completion.chunk",
-					Created: time.Now().Unix(),
-					Model:   upstreamReq.Model,
-					Choices: []Choice{{Index: 0, Delta: Delta{}, FinishReason: "tool_calls"}},
-				}
-				writeSSEChunk(w, endChunk)
-				flusher.Flush()
-				sentFinish = true
-			}
-			break
-		}
-	}
-
-	// 检查是否有读取错误
-	if readErr != nil {
-		debugLog("读取SSE流错误: %v", readErr)
-	}
-
-	// 如果流在 thinking phase 结束，确保闭合标签已发送
-	if inThinkingPhase {
-		debugLog("Stream ended during thinking phase. Sending closing </think> tag.")
-		closingChunk := OpenAIResponse{
-			ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   upstreamReq.Model,
-			Choices: []Choice{
-				{
-					Index: 0,
-					Delta: Delta{ReasoningContent: "</think>"},
-				},
-			},
-		}
-		writeSSEChunk(w, closingChunk)
-		flusher.Flush()
-	}
-
-	// 根据是否有工具调用决定结束原因
-	finishReason := "stop"
-	if len(toolCalls) > 0 {
-		finishReason = "tool_calls"
-	}
-
-	// 发送结束块
-	if !sentFinish {
-		endChunk := OpenAIResponse{
-			ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   upstreamReq.Model,
-			Choices: []Choice{{Index: 0, Delta: Delta{}, FinishReason: finishReason}},
-		}
-		writeSSEChunk(w, endChunk)
-		flusher.Flush()
-		sentFinish = true
-	}
-
-	// 发送DONE信号
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-	debugLog("流式响应完成，共处理%d行", lineCount)
-
-	// 记录统计信息
-	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
-	var tokens int64
-	if lastUsage != nil {
-		if total, ok := lastUsage["total_tokens"]; ok {
-			if totalVal, ok := total.(float64); ok {
-				tokens = int64(totalVal)
-			}
-		}
-	}
-	recordRequestStats(startTime, r.URL.Path, 200, tokens, modelName, true)
-	addLiveRequest(r.Method, r.URL.Path, 200, duration, userAgent, modelName)
 }

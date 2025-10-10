@@ -35,20 +35,16 @@ func setupRouter() *gin.Engine {
 
 	// 健康检查和监控端点
 	router.GET("/health", GinHandleHealth)
-	router.GET("/dashboard", func(c *gin.Context) {
-		handleDashboard(c.Writer, c.Request)
-	})
-	router.GET("/dashboard/stats", func(c *gin.Context) {
-		handleDashboardStats(c.Writer, c.Request)
-	})
-	router.GET("/dashboard/requests", func(c *gin.Context) {
-		handleDashboardRequests(c.Writer, c.Request)
-	})
+	router.GET("/", GinHandleHome)
+	router.GET("/dashboard", GinHandleDashboard)
+	router.GET("/dashboard/stats", GinHandleDashboardStats)
+	router.GET("/dashboard/requests", GinHandleDashboardRequests)
 
-	// OPTIONS 处理
-	router.OPTIONS("/*path", func(c *gin.Context) {
-		handleOptions(c.Writer, c.Request)
-	})
+	// OPTIONS 处理 - CORS 已在中间件处理，这里只返回成功
+	router.OPTIONS("/*path", GinHandleOptions)
+
+	// 404 处理器
+	router.NoRoute(GinHandleNotFound)
 
 	return router
 }
@@ -112,7 +108,8 @@ func rateLimitMiddleware() gin.HandlerFunc {
 				"error": gin.H{
 					"message": "Too many concurrent requests, please try again later",
 					"type":    "rate_limit_exceeded",
-					"code":    "rate_limit_exceeded",
+					"code":    429,
+					"param":   nil,
 				},
 			})
 			c.Abort()

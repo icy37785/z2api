@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -31,42 +30,45 @@ func GinHandleChatCompletions(c *gin.Context) {
 	// API Key 验证 - 使用 Gin 方式
 	authHeader := c.GetHeader("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+		c.AbortWithStatusJSON(StatusUnauthorized, gin.H{
 			"error": gin.H{
 				"message": "Missing or invalid Authorization header",
-				"type":    "invalid_api_key",
-				"code":    "invalid_api_key",
+				"type":    "invalid_request_error",
+				"code":    401,
+				"param":   "authorization",
 			},
 		})
-		recordError(c, startTime, http.StatusUnauthorized, "invalid_api_key")
+		recordError(c, startTime, StatusUnauthorized, "invalid_api_key")
 		return
 	}
 
 	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
 	if apiKey != appConfig.DefaultKey {
-		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+		c.AbortWithStatusJSON(StatusUnauthorized, gin.H{
 			"error": gin.H{
-				"message": "Invalid API key",
-				"type":    "invalid_api_key",
-				"code":    "invalid_api_key",
+				"message": "Invalid API key provided",
+				"type":    "invalid_request_error",
+				"code":    401,
+				"param":   "api_key",
 			},
 		})
-		recordError(c, startTime, http.StatusUnauthorized, "invalid_api_key")
+		recordError(c, startTime, StatusUnauthorized, "invalid_api_key")
 		return
 	}
 
 	// 使用 Gin 的 JSON 绑定 - 自动解析和验证
 	var req OpenAIRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+		c.AbortWithStatusJSON(StatusBadRequest, gin.H{
 			"error": gin.H{
 				"message": "Invalid JSON format",
 				"type":    "invalid_request_error",
-				"code":    "invalid_request_error",
+				"code":    400,
+				"param":   nil,
 				"details": err.Error(),
 			},
 		})
-		recordError(c, startTime, http.StatusBadRequest, "invalid_request_error")
+		recordError(c, startTime, StatusBadRequest, "invalid_request_error")
 		return
 	}
 
@@ -77,14 +79,15 @@ func GinHandleChatCompletions(c *gin.Context) {
 
 	// 验证输入
 	if err := validateAndSanitizeInput(&req); err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+		c.AbortWithStatusJSON(StatusBadRequest, gin.H{
 			"error": gin.H{
 				"message": err.Error(),
 				"type":    "invalid_request_error",
-				"code":    "invalid_request_error",
+				"code":    400,
+				"param":   nil,
 			},
 		})
-		recordError(c, startTime, http.StatusBadRequest, "invalid_request_error")
+		recordError(c, startTime, StatusBadRequest, "invalid_request_error")
 		return
 	}
 
@@ -128,15 +131,15 @@ func handleStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, chatID
 	// 调用上游API
 	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
+		c.AbortWithStatusJSON(StatusBadGateway, gin.H{
 			"error": gin.H{
 				"message": "Failed to call upstream after retries",
 				"type":    "upstream_error",
-				"code":    "upstream_error",
+				"code":    502,
 				"details": err.Error(),
 			},
 		})
-		recordError(c, startTime, http.StatusBadGateway, "upstream_error")
+		recordError(c, startTime, StatusBadGateway, "upstream_error")
 		return
 	}
 	defer func() {
@@ -145,58 +148,46 @@ func handleStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, chatID
 	}()
 
 	// 检查响应状态
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
+		c.AbortWithStatusJSON(StatusBadGateway, gin.H{
 			"error": gin.H{
 				"message": "Upstream error",
 				"type":    "upstream_error",
-				"code":    "upstream_error",
+				"code":    502,
 				"details": fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body)),
 			},
 		})
-		recordError(c, startTime, http.StatusBadGateway, "upstream_error")
+		recordError(c, startTime, StatusBadGateway, "upstream_error")
 		return
 	}
-
-	// 使用 Gin 的流式响应
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
 
 	// 发送初始块
 	firstChunk := OpenAIResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
 		Object:  "chat.completion.chunk",
 		Created: time.Now().Unix(),
-		Model:   upstreamReq.Model,
+		Model:   modelName,
 		Choices: []Choice{{
 			Index: 0,
 			Delta: Delta{Role: "assistant"},
 		}},
 	}
 
-	// 使用 Gin 的 SSEvent 方法
-	c.Stream(func(w io.Writer) bool {
-		// 写入第一个块
-		if data, err := sonicStream.Marshal(firstChunk); err == nil {
-			fmt.Fprintf(w, "data: %s\n\n", string(data))
-			c.Writer.Flush()
-		}
-		return false
-	})
+	// 设置 SSE 响应头
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // 禁用 Nginx 缓冲
 
-	// 处理流式响应
-	checkClient := func() bool {
-		select {
-		case <-c.Request.Context().Done():
-			return false
-		default:
-			return true
-		}
+	// 写入第一个块
+	if data, err := sonicStream.Marshal(firstChunk); err == nil {
+		c.Writer.WriteString(fmt.Sprintf("data: %s\n\n", string(data)))
+		c.Writer.Flush()
 	}
 
-	if err := HandleStreamResponse(c.Writer, resp, modelName, checkClient); err != nil {
+	// 使用新的 Gin 流式处理器
+	if err := HandleGinStreamResponse(c, &resp.Body, modelName); err != nil {
 		debugLog("流式响应处理错误: %v", err)
 	}
 
@@ -215,15 +206,15 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 
 	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
+		c.AbortWithStatusJSON(StatusBadGateway, gin.H{
 			"error": gin.H{
 				"message": "Failed to call upstream",
 				"type":    "upstream_error",
-				"code":    "upstream_error",
+				"code":    502,
 				"details": err.Error(),
 			},
 		})
-		recordError(c, startTime, http.StatusBadGateway, "upstream_error")
+		recordError(c, startTime, StatusBadGateway, "upstream_error")
 		return
 	}
 	defer func() {
@@ -231,25 +222,25 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 		resp.Body.Close()
 	}()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
+		c.AbortWithStatusJSON(StatusBadGateway, gin.H{
 			"error": gin.H{
 				"message": "Upstream error",
 				"type":    "upstream_error",
-				"code":    "upstream_error",
+				"code":    502,
 				"details": fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body)),
 			},
 		})
-		recordError(c, startTime, http.StatusBadGateway, "upstream_error")
+		recordError(c, startTime, StatusBadGateway, "upstream_error")
 		return
 	}
 
 	// 聚合流式响应
-	aggregator := NewStreamAggregator()
+	aggregator := NewGinStreamAggregator()
 	bufReader := bufio.NewReader(resp.Body)
 
-	debugLog("开始聚合流式响应为非流式格式")
+	debugLog("开始聚合流式响应为非流式格式 (Gin版)")
 
 	lineCount := 0
 	totalSize := int64(0)
@@ -280,11 +271,12 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 		// 检查大小限制
 		if totalSize > MaxResponseSize {
 			debugLog("响应大小超出限制")
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+			c.AbortWithStatusJSON(StatusInternalServerError, gin.H{
 				"error": gin.H{
 					"message": "Response size exceeded limit",
 					"type":    "aggregation_error",
-					"code":    "response_too_large",
+					"code":    500,
+					"param":   "response_size",
 				},
 			})
 			return
@@ -298,14 +290,15 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 
 	// 检查错误
 	if aggregator.Error != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+		c.AbortWithStatusJSON(StatusInternalServerError, gin.H{
 			"error": gin.H{
 				"message": aggregator.ErrorDetail,
 				"type":    "aggregation_error",
-				"code":    "aggregation_error",
+				"code":    500,
+				"param":   nil,
 			},
 		})
-		recordError(c, startTime, http.StatusInternalServerError, "aggregation_error")
+		recordError(c, startTime, StatusInternalServerError, "aggregation_error")
 		return
 	}
 
@@ -316,7 +309,7 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq UpstreamRequest, cha
 	openAIResp := buildNonStreamResponse(content, reasoningContent, toolCalls, usage, modelName)
 
 	// 使用 Gin 的 JSON 方法发送响应
-	c.JSON(http.StatusOK, openAIResp)
+	c.JSON(StatusOK, openAIResp)
 
 	// 记录统计
 	recordSuccess(c, startTime, modelName, false)
@@ -346,7 +339,7 @@ func GinHandleModels(c *gin.Context) {
 		},
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(StatusOK, gin.H{
 		"object": "list",
 		"data":   models,
 	})
@@ -354,7 +347,7 @@ func GinHandleModels(c *gin.Context) {
 
 // GinHandleHealth 健康检查 (Gin 原生实现)
 func GinHandleHealth(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(StatusOK, gin.H{
 		"status":    "healthy",
 		"timestamp": time.Now().Unix(),
 		"version":   "1.0.0",
@@ -486,6 +479,6 @@ func recordError(c *gin.Context, startTime time.Time, statusCode int, errorType 
 func recordSuccess(c *gin.Context, startTime time.Time, modelName string, isStream bool) {
 	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 	userAgent := c.GetString("user_agent")
-	recordRequestStats(startTime, c.Request.URL.Path, http.StatusOK, 0, modelName, isStream)
-	addLiveRequest(c.Request.Method, c.Request.URL.Path, http.StatusOK, duration, userAgent, modelName)
+	recordRequestStats(startTime, c.Request.URL.Path, StatusOK, 0, modelName, isStream)
+	addLiveRequest(c.Request.Method, c.Request.URL.Path, StatusOK, duration, userAgent, modelName)
 }
