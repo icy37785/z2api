@@ -89,7 +89,7 @@ func (cv *CustomValidator) formatValidationError(err error) error {
 			case "top_p":
 				errorMessages = append(errorMessages, "Top_p must be between 0.0 and 1.0")
 			default:
-				errorMessages = append(errorMessages, fmt.Sprintf("Field '%s' failed validation: %s", e.Field(), e.Tag()))
+				errorMessages = append(errorMessages, "Field '"+e.Field()+"' failed validation: "+e.Tag())
 			}
 		}
 

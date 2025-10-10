@@ -1,9 +1,11 @@
 package main
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"z2api/errors"
 	"z2api/types"
 	"z2api/utils"
 )
@@ -11,15 +13,15 @@ import (
 // GinHandleDashboard 处理仪表盘页面 (Gin 原生实现)
 func GinHandleDashboard(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(StatusOK, dashboardHTML)
+	c.String(http.StatusOK, dashboardHTML)
 }
 
 // GinHandleDashboardStats 处理仪表盘统计端点 (Gin 原生实现)
 func GinHandleDashboardStats(c *gin.Context) {
 	// 检查 stats 是否已初始化
 	if stats == nil {
-		utils.ErrorResponse(c, StatusInternalServerError, "internal_error",
-			"Stats not initialized", nil)
+		err := errors.ErrInternalError.WithDetails("Stats not initialized")
+		utils.ErrorResponse(c, err)
 		return
 	}
 
@@ -51,7 +53,7 @@ func GinHandleDashboardStats(c *gin.Context) {
 	}
 
 	// 使用 Gin 的 JSON 响应方法
-	c.JSON(StatusOK, statsResponse)
+	c.JSON(http.StatusOK, statsResponse)
 }
 
 // GinHandleDashboardRequests 处理仪表盘实时请求端点 (Gin 原生实现)
@@ -68,13 +70,13 @@ func GinHandleDashboardRequests(c *gin.Context) {
 	}
 
 	// 使用 Gin 的 JSON 响应方法
-	c.JSON(StatusOK, requests)
+	c.JSON(http.StatusOK, requests)
 }
 
 // GinHandleOptions 处理 OPTIONS 请求 (Gin 原生实现)
 func GinHandleOptions(c *gin.Context) {
 	// CORS 已在中间件中处理，这里只需要返回成功
-	c.Status(StatusOK)
+	c.Status(http.StatusOK)
 }
 
 // GinHandleHome 处理根路径 (Gin 原生实现)
@@ -87,13 +89,13 @@ func GinHandleHome(c *gin.Context) {
 	}
 
 	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(StatusOK, "<h1>ZtoApi</h1><p>OpenAI compatible API for Z.ai.</p>")
+	c.String(http.StatusOK, "<h1>ZtoApi</h1><p>OpenAI compatible API for Z.ai.</p>")
 }
 
 // GinHandleNotFound 处理 404 页面 (Gin 原生实现)
 func GinHandleNotFound(c *gin.Context) {
-	utils.ErrorResponse(c, StatusNotFound, "not_found",
-		"Resource not found", c.Request.URL.Path)
+	err := errors.ErrModelNotFound.WithParam(c.Request.URL.Path)
+	utils.ErrorResponse(c, err)
 }
 
 // StatsResponse 统计响应结构 (用于更好的类型安全)
@@ -120,8 +122,6 @@ type ModelUsageResponse struct {
 	Model string `json:"model"`
 	Count int64  `json:"count"`
 }
-
-
 
 // 辅助函数：设置 JSON 响应头
 func setJSONHeaders(c *gin.Context) {

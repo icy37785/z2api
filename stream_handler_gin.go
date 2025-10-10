@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
+
+	"z2api/internal/toolhandler"
+	"z2api/types"
 
 	"github.com/gin-gonic/gin"
-	"z2api/types"
 )
 
 // GinStreamHandler 基于 Gin 的流式响应处理器
@@ -15,16 +18,24 @@ type GinStreamHandler struct {
 	ctx             *gin.Context
 	model           string
 	toolCallMgr     *ToolCallManager
+	sseToolHandler  *toolhandler.SSEToolHandler // 新增：SSE工具处理器
 	inThinkingPhase bool
 	sentFinish      bool
 }
 
 // NewGinStreamHandler 创建新的 Gin 流式响应处理器
 func NewGinStreamHandler(c *gin.Context, model string) *GinStreamHandler {
+	// 生成chatID（使用请求ID或生成新的）
+	chatID := c.GetString("RequestID")
+	if chatID == "" {
+		chatID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+
 	return &GinStreamHandler{
-		ctx:         c,
-		model:       model,
-		toolCallMgr: NewToolCallManager(),
+		ctx:            c,
+		model:          model,
+		toolCallMgr:    NewToolCallManager(),
+		sseToolHandler: toolhandler.NewSSEToolHandler(chatID, model, debugLog),
 	}
 }
 
@@ -80,15 +91,16 @@ func (h *GinStreamHandler) ProcessAnswerPhase(data *types.UpstreamData) {
 
 // ProcessToolCallPhase 处理工具调用阶段
 func (h *GinStreamHandler) ProcessToolCallPhase(data *types.UpstreamData) {
-	if len(data.Data.ToolCalls) > 0 {
-		// 添加工具调用到管理器
-		h.toolCallMgr.AddToolCalls(data.Data.ToolCalls)
+	// 使用新的SSEToolHandler处理工具调用
+	chunks := h.sseToolHandler.ProcessToolCallPhase(data)
+	for _, chunk := range chunks {
+		h.ctx.Writer.WriteString(chunk + "\n\n")
+		h.ctx.Writer.Flush()
+	}
 
-		// 创建工具调用响应块
-		chunk := createToolCallChunk(data.Data.ToolCalls, h.model, "")
-		if jsonData, err := sonicStream.Marshal(chunk); err == nil {
-			h.WriteSSEData(string(jsonData))
-		}
+	// 如果有原生的tool_calls（向后兼容）
+	if len(data.Data.ToolCalls) > 0 {
+		h.toolCallMgr.AddToolCalls(data.Data.ToolCalls)
 	}
 
 	// 处理工具调用相关的文本内容
@@ -102,6 +114,30 @@ func (h *GinStreamHandler) ProcessToolCallPhase(data *types.UpstreamData) {
 
 // ProcessOtherPhase 处理其他阶段
 func (h *GinStreamHandler) ProcessOtherPhase(data *types.UpstreamData) {
+	// 使用新的SSEToolHandler处理other阶段（可能包含工具调用结束信号）
+	chunks := h.sseToolHandler.ProcessOtherPhase(data)
+	hasToolFinish := false
+	for _, chunk := range chunks {
+		h.ctx.Writer.WriteString(chunk + "\n\n")
+		h.ctx.Writer.Flush()
+		// 检查是否包含工具完成信号
+		if strings.Contains(chunk, `"finish_reason":"tool_calls"`) {
+			hasToolFinish = true
+		}
+	}
+
+	// 如果SSEToolHandler已经处理了工具调用结束，标记为已完成
+	if hasToolFinish {
+		h.sentFinish = true
+		return
+	}
+
+	// 如果SSEToolHandler返回了其他chunks，也直接返回
+	if len(chunks) > 0 {
+		return
+	}
+
+	// 否则按原逻辑处理
 	content := data.Data.DeltaContent
 	var usage *types.Usage
 
@@ -158,12 +194,9 @@ func (h *GinStreamHandler) ProcessDonePhase(data *types.UpstreamData) {
 		return
 	}
 
-	// 如果在思考阶段结束，发送闭合标签
+	// 如果在思考阶段结束，不再单独发送闭合标签
+	// 闭合标签应该已经在思考内容中包含
 	if h.inThinkingPhase {
-		closingChunk := createChatCompletionChunk("</think>", h.model, PhaseThinking, nil, "")
-		if jsonData, err := sonicStream.Marshal(closingChunk); err == nil {
-			h.WriteSSEData(string(jsonData))
-		}
 		h.inThinkingPhase = false
 	}
 

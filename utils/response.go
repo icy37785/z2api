@@ -2,47 +2,74 @@ package utils
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"z2api/errors"
 )
 
 // ErrorResponse 统一的错误响应处理
-func ErrorResponse(c *gin.Context, statusCode int, errorType, message string, param interface{}) {
-	c.AbortWithStatusJSON(statusCode, gin.H{
-		"error": gin.H{
-			"message": message,
-			"type":    errorType,
-			"code":    statusCode,
-			"param":   param,
-		},
-	})
-}
+func ErrorResponse(c *gin.Context, err errors.APIError) {
+	// 检查是否为调试模式
+	debugMode := c.GetBool("debug_mode")
 
-// ErrorResponseWithDetails 带详细信息的错误响应
-func ErrorResponseWithDetails(c *gin.Context, statusCode int, errorType, message string, param interface{}, details string) {
 	response := gin.H{
 		"error": gin.H{
-			"message": message,
-			"type":    errorType,
-			"code":    statusCode,
-			"param":   param,
+			"message": err.Message,
+			"type":    err.Type,
+			"code":    err.Code,
 		},
 	}
 
-	if details != "" {
-		if errorMap, ok := response["error"].(gin.H); ok {
-			errorMap["details"] = details
-		}
+	// 添加可选字段
+	if err.Param != "" {
+		response["error"].(gin.H)["param"] = err.Param
 	}
 
-	c.AbortWithStatusJSON(statusCode, response)
+	if err.Details != "" {
+		response["error"].(gin.H)["details"] = err.Details
+	}
+
+	if debugMode && err.Debug != "" {
+		response["error"].(gin.H)["debug"] = err.Debug
+	}
+
+	c.AbortWithStatusJSON(err.StatusCode, response)
+}
+
+// ErrorResponseWithMessage 直接使用消息创建错误响应
+func ErrorResponseWithMessage(c *gin.Context, statusCode int, errorType, message string) {
+	err := errors.NewInvalidRequestError(message)
+	err.StatusCode = statusCode
+	err.Code = statusCode
+	err.Type = errorType
+	ErrorResponse(c, err)
+}
+
+// ErrorResponseWithParam 使用带参数的错误响应
+func ErrorResponseWithParam(c *gin.Context, statusCode int, errorType, message, param string) {
+	err := errors.NewInvalidRequestErrorWithParam(message, param)
+	err.StatusCode = statusCode
+	err.Code = statusCode
+	err.Type = errorType
+	ErrorResponse(c, err)
+}
+
+// ValidationError 响应验证错误
+func ValidationError(c *gin.Context, message string) {
+	ErrorResponse(c, errors.NewValidationError(message))
+}
+
+// ValidationErrorWithParam 响应带参数的验证错误
+func ValidationErrorWithParam(c *gin.Context, message, param string) {
+	ErrorResponse(c, errors.NewValidationErrorWithParam(message, param))
 }
 
 // SuccessResponse 统一的成功响应
 func SuccessResponse(c *gin.Context, data interface{}) {
-	c.JSON(200, data)
+	c.JSON(http.StatusOK, data)
 }
 
 // StreamResponse 统一的流式响应设置

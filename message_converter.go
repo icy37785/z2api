@@ -72,7 +72,7 @@ func (mc *MessageConverter) PrepareData(req types.OpenAIRequest, sessionID strin
 func (mc *MessageConverter) processMessages(messages []types.Message) ([]types.UpstreamMessage, []map[string]interface{}, error) {
 	var processedMessages []types.UpstreamMessage
 	var files []map[string]interface{}
-	
+
 	// 创建多模态处理器
 	processor := utils.NewMultimodalProcessor("")
 	processor.EnableDebugLog = appConfig.DebugMode
@@ -80,11 +80,11 @@ func (mc *MessageConverter) processMessages(messages []types.Message) ([]types.U
 	for _, msg := range messages {
 		// 使用统一处理器处理内容
 		result, err := processor.ProcessContent(msg.Content)
-		
+
 		var textContent string
 		if err == nil {
 			textContent = result.Text
-			
+
 			// 处理图片文件上传
 			for _, imageURL := range result.Images {
 				fileID, uploadErr := mc.uploadImage(imageURL)
@@ -97,7 +97,7 @@ func (mc *MessageConverter) processMessages(messages []types.Message) ([]types.U
 					"id":   fileID,
 				})
 			}
-			
+
 			// 处理其他已有文件ID的文件
 			for _, file := range result.Files {
 				if file.FileID != "" {
@@ -131,13 +131,13 @@ func (mc *MessageConverter) processMessages(messages []types.Message) ([]types.U
 func (mc *MessageConverter) processMultimodalContent(msg types.Message) (string, []map[string]interface{}, error) {
 	processor := utils.NewMultimodalProcessor("")
 	result, err := processor.ProcessContent(msg.Content)
-	
+
 	if err != nil {
 		return "", nil, err
 	}
-	
+
 	var files []map[string]interface{}
-	
+
 	// 处理图片上传
 	for _, imageURL := range result.Images {
 		fileID, uploadErr := mc.uploadImage(imageURL)
@@ -150,7 +150,7 @@ func (mc *MessageConverter) processMultimodalContent(msg types.Message) (string,
 			"id":   fileID,
 		})
 	}
-	
+
 	return result.Text, files, nil
 }
 
@@ -214,7 +214,7 @@ func CreateChatCompletionData(
 	phase string,
 	usage *types.Usage,
 	finishReason string,
-) types.OpenAIResponse{
+) types.OpenAIResponse {
 	timestamp := time.Now().Unix()
 	responseID := utils.GenerateChatCompletionID()
 
@@ -272,7 +272,7 @@ func CreateChatCompletionData(
 
 	// 添加使用统计（如果有）
 	if usage != nil {
-		response.Usage = *usage
+		response.Usage = usage
 	}
 
 	return response

@@ -2,25 +2,36 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"z2api/config"
+	"z2api/errors"
 	"z2api/internal/mapper"
 	"z2api/types"
 	"z2api/utils"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-playground/validator/v10"
 )
 
 // GinHandleChatCompletions 充分利用 Gin 特性的处理器
 func GinHandleChatCompletions(c *gin.Context) {
 	startTime := time.Now()
 
+	// 使用 context 超时控制
+	ctx := c.Request.Context()
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
 	// 使用 Gin 的上下文存储
 	c.Set("start_time", startTime)
 	c.Set("user_agent", c.GetHeader("User-Agent"))
+	c.Set("debug_mode", appConfig.DebugMode)
 
 	// 更新监控指标
 	totalRequests.Add(1)
@@ -29,42 +40,48 @@ func GinHandleChatCompletions(c *gin.Context) {
 
 	// 并发控制 - 在中间件中已处理，这里跳过
 
-	// API Key 验证 - 使用 utils 统一错误处理
+	// API Key 验证 - 使用新的错误处理
 	authHeader := c.GetHeader("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		utils.ErrorResponse(c, StatusUnauthorized, "invalid_request_error",
-			"Missing or invalid Authorization header", "authorization")
-		recordError(c, startTime, StatusUnauthorized, "invalid_api_key")
+		utils.ErrorResponse(c, errors.ErrInvalidAPIKey.WithParam("authorization"))
+		recordError(c, startTime, errors.ErrInvalidAPIKey.StatusCode, "invalid_api_key")
 		return
 	}
 
 	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
 	if apiKey != appConfig.DefaultKey {
-		utils.ErrorResponse(c, StatusUnauthorized, "invalid_request_error",
-			"Invalid API key provided", "api_key")
-		recordError(c, startTime, StatusUnauthorized, "invalid_api_key")
+		utils.ErrorResponse(c, errors.ErrInvalidAPIKey.WithParam("api_key"))
+		recordError(c, startTime, errors.ErrInvalidAPIKey.StatusCode, "invalid_api_key")
 		return
 	}
 
 	// 使用 Gin 的 JSON 绑定 - 自动解析和验证
 	var req types.OpenAIRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.ErrorResponseWithDetails(c, StatusBadRequest, "invalid_request_error",
-			"Invalid JSON format", nil, err.Error())
-		recordError(c, startTime, StatusBadRequest, "invalid_request_error")
+		// 检查是否为验证错误
+		if validationErrors, ok := err.(validator.ValidationErrors); ok {
+			// 处理具体的验证错误
+			for _, e := range validationErrors {
+				utils.ValidationErrorWithParam(c, getValidationErrorMessage(e), e.Field())
+				recordError(c, startTime, http.StatusBadRequest, "validation_error")
+				return
+			}
+		}
+
+		utils.ErrorResponse(c, errors.ErrInvalidJSON.WithDetails(err.Error()))
+		recordError(c, startTime, http.StatusBadRequest, "invalid_request_error")
 		return
 	}
 
 	debugLog("请求解析成功 - 模型: %s, 流式: %v, 消息数: %d", req.Model, req.Stream, len(req.Messages))
 
-	// 设置默认参数
+	// 设置默认参数（如果需要）
 	setDefaultParams(&req)
 
-	// 验证输入
-	if err := validateAndSanitizeInput(&req); err != nil {
-		utils.ErrorResponse(c, StatusBadRequest, "invalid_request_error",
-			err.Error(), nil)
-		recordError(c, startTime, StatusBadRequest, "invalid_request_error")
+	// 验证输入（额外的业务逻辑验证）
+	if err := validateBusinessRules(&req); err != nil {
+		utils.ErrorResponse(c, err.(errors.APIError))
+		recordError(c, startTime, http.StatusBadRequest, "validation_error")
 		return
 	}
 
@@ -93,23 +110,22 @@ func GinHandleChatCompletions(c *gin.Context) {
 
 	// 根据请求类型调用不同的处理函数
 	if req.Stream {
-		handleStreamResponseGin(c, upstreamReq, chatID, authToken, modelConfig.Name, sessionID)
+		handleStreamResponseGin(timeoutCtx, c, upstreamReq, chatID, authToken, modelConfig.Name, sessionID)
 	} else {
-		handleNonStreamResponseGin(c, upstreamReq, chatID, authToken, modelConfig.Name, sessionID)
+		handleNonStreamResponseGin(timeoutCtx, c, upstreamReq, chatID, authToken, modelConfig.Name, sessionID)
 	}
 }
 
 // handleStreamResponseGin 使用 Gin 的流式响应处理
-func handleStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamRequest, chatID string, authToken string, modelName string, sessionID string) {
+func handleStreamResponseGin(ctx context.Context, c *gin.Context, upstreamReq types.UpstreamRequest, chatID string, authToken string, modelName string, sessionID string) {
 	startTime := c.GetTime("start_time")
 	debugLog("开始处理流式响应 (Gin版) (chat_id=%s, model=%s)", chatID, upstreamReq.Model)
 
-	// 调用上游API
-	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
+	// 调用上游API，传递context
+	resp, cancel, err := callUpstreamWithContext(ctx, upstreamReq, chatID, authToken, sessionID)
 	if err != nil {
-		utils.ErrorResponseWithDetails(c, StatusBadGateway, "upstream_error",
-			"Failed to call upstream after retries", nil, err.Error())
-		recordError(c, startTime, StatusBadGateway, "upstream_error")
+		utils.ErrorResponse(c, errors.NewUpstreamError(err.Error()))
+		recordError(c, startTime, http.StatusBadGateway, "upstream_error")
 		return
 	}
 	defer func() {
@@ -118,11 +134,10 @@ func handleStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamRequest, 
 	}()
 
 	// 检查响应状态
-	if resp.StatusCode != StatusOK {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		utils.ErrorResponseWithDetails(c, StatusBadGateway, "upstream_error",
-			"Upstream error", nil, fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body)))
-		recordError(c, startTime, StatusBadGateway, "upstream_error")
+		utils.ErrorResponse(c, errors.NewUpstreamError(fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body))))
+		recordError(c, startTime, http.StatusBadGateway, "upstream_error")
 		return
 	}
 
@@ -147,8 +162,8 @@ func handleStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamRequest, 
 		c.Writer.Flush()
 	}
 
-	// 使用新的 Gin 流式处理器
-	if err := HandleGinStreamResponse(c, &resp.Body, modelName); err != nil {
+	// 使用新的 Gin 流式处理器，传递context
+	if err := HandleGinStreamResponseWithContext(ctx, c, &resp.Body, modelName); err != nil {
 		debugLog("流式响应处理错误: %v", err)
 	}
 
@@ -158,18 +173,17 @@ func handleStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamRequest, 
 }
 
 // handleNonStreamResponseGin 使用 Gin 的非流式响应处理
-func handleNonStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamRequest, chatID string, authToken string, modelName string, sessionID string) {
+func handleNonStreamResponseGin(ctx context.Context, c *gin.Context, upstreamReq types.UpstreamRequest, chatID string, authToken string, modelName string, sessionID string) {
 	startTime := c.GetTime("start_time")
 	debugLog("开始处理非流式响应 (Gin版) (chat_id=%s, model=%s)", chatID, upstreamReq.Model)
 
 	// 强制使用流式从上游获取
 	upstreamReq.Stream = true
 
-	resp, cancel, err := callUpstreamWithRetry(upstreamReq, chatID, authToken, sessionID)
+	resp, cancel, err := callUpstreamWithContext(ctx, upstreamReq, chatID, authToken, sessionID)
 	if err != nil {
-		utils.ErrorResponseWithDetails(c, StatusBadGateway, "upstream_error",
-			"Failed to call upstream", nil, err.Error())
-		recordError(c, startTime, StatusBadGateway, "upstream_error")
+		utils.ErrorResponse(c, errors.NewUpstreamError(err.Error()))
+		recordError(c, startTime, http.StatusBadGateway, "upstream_error")
 		return
 	}
 	defer func() {
@@ -177,15 +191,14 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamReques
 		resp.Body.Close()
 	}()
 
-	if resp.StatusCode != StatusOK {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		utils.ErrorResponseWithDetails(c, StatusBadGateway, "upstream_error",
-			"Upstream error", nil, fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body)))
-		recordError(c, startTime, StatusBadGateway, "upstream_error")
+		utils.ErrorResponse(c, errors.NewUpstreamError(fmt.Sprintf("状态: %d, 响应: %s", resp.StatusCode, string(body))))
+		recordError(c, startTime, http.StatusBadGateway, "upstream_error")
 		return
 	}
 
-	// 聚合流式响应
+	// 聚合流式响应，传递context
 	aggregator := NewGinStreamAggregator()
 	bufReader := bufio.NewReader(resp.Body)
 
@@ -195,8 +208,11 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamReques
 	totalSize := int64(0)
 
 	for {
-		// 检查客户端是否断开
+		// 检查客户端是否断开或context超时
 		select {
+		case <-ctx.Done():
+			debugLog("context取消或超时，停止处理: %v", ctx.Err())
+			return
 		case <-c.Request.Context().Done():
 			debugLog("客户端断开连接，停止处理")
 			return
@@ -220,8 +236,7 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamReques
 		// 检查大小限制
 		if totalSize > MaxResponseSize {
 			debugLog("响应大小超出限制")
-			utils.ErrorResponse(c, StatusInternalServerError, "aggregation_error",
-				"Response size exceeded limit", "response_size")
+			utils.ErrorResponse(c, errors.ErrContentTooLong)
 			return
 		}
 
@@ -233,9 +248,8 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamReques
 
 	// 检查错误
 	if aggregator.Error != nil {
-		utils.ErrorResponse(c, StatusInternalServerError, "aggregation_error",
-			aggregator.ErrorDetail, nil)
-		recordError(c, startTime, StatusInternalServerError, "aggregation_error")
+		utils.ErrorResponse(c, errors.NewValidationError(aggregator.ErrorDetail))
+		recordError(c, startTime, http.StatusInternalServerError, "aggregation_error")
 		return
 	}
 
@@ -246,7 +260,7 @@ func handleNonStreamResponseGin(c *gin.Context, upstreamReq types.UpstreamReques
 	openAIResp := buildNonStreamResponse(content, reasoningContent, toolCalls, usage, modelName)
 
 	// 使用 Gin 的 JSON 方法发送响应
-	c.JSON(StatusOK, openAIResp)
+	c.JSON(http.StatusOK, openAIResp)
 
 	// 记录统计
 	recordSuccess(c, startTime, modelName, false)
@@ -276,7 +290,7 @@ func GinHandleModels(c *gin.Context) {
 		},
 	}
 
-	c.JSON(StatusOK, gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   models,
 	})
@@ -284,7 +298,7 @@ func GinHandleModels(c *gin.Context) {
 
 // GinHandleHealth 健康检查 (Gin 原生实现)
 func GinHandleHealth(c *gin.Context) {
-	c.JSON(StatusOK, gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"status":    "healthy",
 		"timestamp": time.Now().Unix(),
 		"version":   "1.0.0",
@@ -311,7 +325,7 @@ func setDefaultParams(req *types.OpenAIRequest) {
 	}
 }
 
-func buildUpstreamRequest(req types.OpenAIRequest, chatID, msgID string, modelConfig config.ModelConfig) types.UpstreamRequest{
+func buildUpstreamRequest(req types.OpenAIRequest, chatID, msgID string, modelConfig config.ModelConfig) types.UpstreamRequest {
 	featureConfig := getModelFeatures(modelConfig.ID, req.Stream)
 	featureConfig = mergeWithModelConfig(featureConfig, modelConfig)
 
@@ -364,7 +378,7 @@ func getAuthToken() string {
 	return authToken
 }
 
-func buildNonStreamResponse(content, reasoningContent string, toolCalls []types.ToolCall, usage *types.Usage, modelName string) types.OpenAIResponse{
+func buildNonStreamResponse(content, reasoningContent string, toolCalls []types.ToolCall, usage *types.Usage, modelName string) types.OpenAIResponse {
 	finishReason := "stop"
 	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
@@ -390,13 +404,13 @@ func buildNonStreamResponse(content, reasoningContent string, toolCalls []types.
 		Model:   modelName,
 		Choices: []types.Choice{{
 			Index:        0,
-			Message:      message,
+			Message:      &message, // 改为指针
 			FinishReason: finishReason,
 		}},
 	}
 
 	if usage != nil && usage.TotalTokens > 0 {
-		resp.Usage = *usage
+		resp.Usage = usage
 	}
 
 	return resp
@@ -413,6 +427,149 @@ func recordError(c *gin.Context, startTime time.Time, statusCode int, errorType 
 func recordSuccess(c *gin.Context, startTime time.Time, modelName string, isStream bool) {
 	duration := float64(time.Since(startTime)) / float64(time.Millisecond)
 	userAgent := c.GetString("user_agent")
-	recordRequestStats(startTime, c.Request.URL.Path, StatusOK, 0, modelName, isStream)
-	addLiveRequest(c.Request.Method, c.Request.URL.Path, StatusOK, duration, userAgent, modelName)
+	recordRequestStats(startTime, c.Request.URL.Path, http.StatusOK, 0, modelName, isStream)
+	addLiveRequest(c.Request.Method, c.Request.URL.Path, http.StatusOK, duration, userAgent, modelName)
+}
+
+// getValidationErrorMessage 转换验证错误为用户友好的消息
+func getValidationErrorMessage(e validator.FieldError) string {
+	switch e.Tag() {
+	case "required":
+		return fmt.Sprintf("字段 %s 是必需的", e.Field())
+	case "min":
+		return fmt.Sprintf("字段 %s 的最小值为 %s", e.Field(), e.Param())
+	case "max":
+		return fmt.Sprintf("字段 %s 的最大值为 %s", e.Field(), e.Param())
+	case "gte":
+		return fmt.Sprintf("字段 %s 必须大于或等于 %s", e.Field(), e.Param())
+	case "lte":
+		return fmt.Sprintf("字段 %s 必须小于或等于 %s", e.Field(), e.Param())
+	case "oneof":
+		return fmt.Sprintf("字段 %s 必须是以下值之一: %s", e.Field(), e.Param())
+	case "url":
+		return fmt.Sprintf("字段 %s 必须是有效的URL", e.Field())
+	case "email":
+		return fmt.Sprintf("字段 %s 必须是有效的邮箱地址", e.Field())
+	default:
+		return fmt.Sprintf("字段 %s 验证失败: %s", e.Field(), e.Tag())
+	}
+}
+
+// validateBusinessRules 验证业务规则（超出基本binding验证的额外逻辑）
+func validateBusinessRules(req *types.OpenAIRequest) error {
+	// 检查消息内容长度
+	totalContentLength := 0
+	for _, msg := range req.Messages {
+		if contentStr, ok := msg.Content.(string); ok {
+			totalContentLength += len(contentStr)
+		}
+		// 可以在这里添加对复杂内容的长度检查
+	}
+
+	if totalContentLength > 1000000 { // 1MB 总限制
+		return errors.ErrContentTooLong.WithDetails("总消息内容过长")
+	}
+
+	// 检查工具定义的合理性
+	if len(req.Tools) > 10 {
+		return errors.ErrTooManyTools.WithDetails("工具数量不能超过10个")
+	}
+
+	// 验证模型特殊要求
+	if strings.Contains(req.Model, "vision") {
+		// vision模型可以处理图片，这里只做日志记录
+		debugLog("检测到vision模型请求")
+		// 注意：vision模型也可以处理纯文本，所以不做强制要求
+	}
+
+	return nil
+}
+
+// callUpstreamWithContext 带context的上游调用
+func callUpstreamWithContext(ctx context.Context, upstreamReq types.UpstreamRequest, chatID, authToken, sessionID string) (*http.Response, context.CancelFunc, error) {
+	return callUpstreamWithHeaders(ctx, upstreamReq, chatID, authToken, sessionID)
+}
+
+// HandleGinStreamResponseWithContext 带context的流式响应处理
+func HandleGinStreamResponseWithContext(ctx context.Context, c *gin.Context, resp *io.ReadCloser, model string) error {
+	// 设置 SSE 响应头
+	SetSSEHeaders(c)
+
+	// 创建流处理器
+	handler := NewGinStreamHandler(c, model)
+
+	// 创建缓冲读取器
+	bufReader := bufio.NewReader(*resp)
+
+	debugLog("开始处理流式响应 (Gin版)，模型：%s", model)
+
+	// 使用 Gin 的 Stream 方法处理流式数据，传递context
+	c.Stream(func(w io.Writer) bool {
+		// 检查context是否取消
+		select {
+		case <-ctx.Done():
+			debugLog("context取消，停止处理: %v", ctx.Err())
+			return false
+		case <-c.Request.Context().Done():
+			debugLog("客户端断开连接，停止处理")
+			return false
+		default:
+		}
+
+		// 读取一行
+		line, err := bufReader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				debugLog("到达流末尾")
+				if !handler.sentFinish {
+					handler.ProcessDonePhase(nil)
+				}
+				return false
+			}
+			debugLog("读取SSE行失败: %v", err)
+			return false
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return true // 继续处理
+		}
+
+		// 处理SSE数据行
+		if strings.HasPrefix(line, "data: ") {
+			dataStr := strings.TrimPrefix(line, "data: ")
+
+			// 检查是否为结束标记
+			if dataStr == "[DONE]" {
+				debugLog("收到[DONE]标记")
+				if !handler.sentFinish {
+					handler.ProcessDonePhase(nil)
+				}
+				return false
+			}
+
+			// 解析JSON数据
+			var upstreamData types.UpstreamData
+			if err := sonicStream.UnmarshalFromString(dataStr, &upstreamData); err != nil {
+				debugLog("解析上游数据失败: %v", err)
+				return true // 继续处理
+			}
+
+			// 处理数据
+			handler.ProcessPhase(&upstreamData)
+
+			// 检查是否完成
+			if upstreamData.Data.Done || upstreamData.Data.Phase == "done" {
+				debugLog("收到完成信号")
+				if !handler.sentFinish {
+					handler.ProcessDonePhase(&upstreamData)
+				}
+				return false
+			}
+		}
+
+		return true // 继续处理
+	})
+
+	return nil
 }

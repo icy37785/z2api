@@ -40,15 +40,48 @@ go test -v -run TestRetry     # 重试机制测试
 go test -v -run TestNonStream # 非流式响应测试
 go test -v -run TestSignature # 签名验证测试
 
-# 功能测试脚本
-./scripts/test_quick.sh         # 快速功能验证（最常用）
-./scripts/test_essential.sh     # 基础功能测试
-./scripts/test_comprehensive.sh # 完整测试套件
-./scripts/test_optimized.sh     # 性能优化测试
+# 运行特定包的测试
+go test -v ./config/...       # 配置相关测试
+go test -v -cover ./...       # 运行覆盖率测试
 
-# 运行覆盖率测试
-go test -v -cover ./...
+# 功能测试脚本（推荐使用顺序）
+./scripts/test_quick.sh         # 快速功能验证（最常用，~30秒）
+./scripts/test_essential.sh     # 基础功能测试（~15秒）
+./scripts/test_comprehensive.sh # 完整测试套件（~2分钟）
+./scripts/test_optimized.sh     # 性能优化测试（~1分钟）
+
+# 工具调用专项测试
+./scripts/test_tool_format.sh       # 工具调用格式验证（~10秒）
+./scripts/test_tool_comprehensive.sh # 工具调用综合测试（~30秒）
 ```
+
+## 项目结构
+
+### 核心文件
+- `main.go`: 主程序入口，包含配置加载、重试机制、上游调用逻辑
+- `router.go`: Gin路由配置和中间件设置
+- `gin_handlers_optimized.go`: 优化的Gin处理器，支持流式/非流式响应
+- `message_converter.go`: OpenAI与GLM格式转换器
+- `stream_handler_gin.go`: Gin流式响应处理
+- `response_helper.go`: 响应辅助函数
+
+### 配置和类型定义
+- `config/`: 配置相关目录
+  - `models.go`: 数据模型定义
+  - `models_test.go`: 配置模型单元测试
+  - `fingerprints.go`: 指纹相关配置
+- `constants.go`: 常量定义
+- `features.go`: 功能特性配置
+- `image_uploader.go`: 图片上传处理
+
+### 测试文件
+- `retry_test.go`: 重试机制单元测试
+- `signature_test.go`: 签名验证单元测试
+- `gin_dashboard_handlers.go`: 监控面板处理器
+
+### 依赖管理
+- `go.mod`: Go模块定义，使用Go 1.25.2
+- 主要依赖：Gin、Sonic JSON、CORS、UUID、信号量限流等
 
 ## 核心架构
 
@@ -84,7 +117,7 @@ go test -v -cover ./...
    - 多模态内容处理（文本+图片）
    - 工具调用参数转换
 
-5. **签名生成** (`signature.go`)
+5. **签名生成** (在 `main.go` 中)
    - JWT token解析获取user_id
    - HMAC-SHA256签名计算
    - 时间戳和请求参数编码
@@ -101,7 +134,7 @@ go test -v -cover ./...
 
 ### 关键特性实现
 
-#### 重试机制 (`retry_*.go`)
+#### 重试机制 (在 `main.go` 中)
 - 可重试错误类型识别（网络、超时、5xx、429等）
 - 指数退避算法：`delay = baseDelay * 2^attempts`
 - 401错误特殊处理：自动刷新token并重新签名
@@ -114,7 +147,7 @@ go test -v -cover ./...
 - **Sonic JSON**: 高性能JSON编解码
 - **压缩支持**: Gzip/Brotli透明处理
 
-#### 模型映射 (`model_mapper.go`)
+#### 模型映射 (在 `main.go` 中)
 - OpenAI模型名到GLM模型名映射
 - 支持别名（gpt-4 → glm-4.5等）
 - 特殊模型识别（thinking、search、vision）
@@ -146,9 +179,10 @@ export DEBUG_MODE=false # 生产模式
 
 ### 常见问题调试
 1. **401错误**: 检查token是否有效，查看token刷新日志
-2. **签名错误**: 验证signature.go中的密钥和算法
+2. **签名错误**: 验证main.go中的签名生成逻辑（密钥和算法）
 3. **流式中断**: 检查SSE解析和缓冲区大小
 4. **性能问题**: 查看并发数和连接池配置
+5. **工具调用问题**: 运行 `./scripts/test_tool_comprehensive.sh` 进行详细诊断
 
 ### 测试特定功能
 ```bash
@@ -161,6 +195,41 @@ curl -N -X POST http://localhost:8080/v1/chat/completions \
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -d '{"model":"glm-4.5","messages":[{"role":"user","content":"Weather?"}],"tools":[...]}'
+```
+
+## 开发工作流
+
+### 日常开发流程
+```bash
+# 1. 启动开发服务器
+go run .
+
+# 2. 快速验证功能
+./scripts/test_quick.sh
+
+# 3. 运行单元测试
+go test -v ./...
+
+# 4. 提交前完整测试
+./scripts/test_comprehensive.sh
+```
+
+### 性能测试
+```bash
+# 对比优化效果
+./scripts/test_optimized.sh
+
+# 压力测试（可选）
+./scripts/test_comprehensive.sh  # 包含并发测试
+```
+
+### 调试工具调用
+```bash
+# 工具调用格式验证
+./scripts/test_tool_format.sh
+
+# 完整工具调用测试
+./scripts/test_tool_comprehensive.sh
 ```
 
 ## 代码规范

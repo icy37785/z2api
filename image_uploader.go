@@ -147,23 +147,23 @@ func ProcessMultimodalMessages(messages []types.Message, authToken string) ([]ty
 	uploader := NewImageUploader(authToken)
 	processor := utils.NewMultimodalProcessor("")
 	processor.EnableDebugLog = appConfig.DebugMode
-	
+
 	var processedMessages []types.UpstreamMessage
 	var files []map[string]interface{}
 
 	for _, msg := range messages {
 		// 使用统一处理器处理内容
 		result, err := processor.ProcessContent(msg.Content)
-		
+
 		var textContent string
 		if err == nil {
 			textContent = result.Text
-			
+
 			// 处理图片上传
 			for _, imageURL := range result.Images {
 				var fileID string
 				var uploadErr error
-				
+
 				if strings.HasPrefix(imageURL, "data:image/") {
 					fileID, uploadErr = uploader.UploadBase64Image(imageURL)
 				} else if strings.HasPrefix(imageURL, "http") {
@@ -172,18 +172,18 @@ func ProcessMultimodalMessages(messages []types.Message, authToken string) ([]ty
 					debugLog("不支持的图片URL格式: %s", imageURL)
 					continue
 				}
-				
+
 				if uploadErr != nil {
 					debugLog("上传图片失败: %v", uploadErr)
 					continue
 				}
-				
+
 				files = append(files, map[string]interface{}{
 					"type": "image",
 					"id":   fileID,
 				})
 			}
-			
+
 			// 处理其他媒体文件（如果需要支持视频、文档等）
 			for _, file := range result.Files {
 				if file.FileID != "" {
@@ -203,7 +203,7 @@ func ProcessMultimodalMessages(messages []types.Message, authToken string) ([]ty
 				textContent = ""
 			}
 		}
-		
+
 		// 创建上游消息
 		processedMessages = append(processedMessages, types.UpstreamMessage{
 			Role:             normalizeRole(msg.Role),

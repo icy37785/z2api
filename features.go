@@ -180,18 +180,18 @@ func convertMultimodalMessages(messages []types.Message) ConvertedMessages {
 	for _, msg := range messages {
 		// 使用统一处理器处理内容
 		processResult, err := processor.ProcessContent(msg.Content)
-		
+
 		// 创建上游消息
 		upstreamMsg := types.UpstreamMessage{
 			Role: msg.Role,
 		}
-		
+
 		if err == nil {
 			upstreamMsg.Content = processResult.Text
-			
+
 			// 收集图片URL
 			result.ImageURLs = append(result.ImageURLs, processResult.Images...)
-			
+
 			// 转换文件信息
 			for _, file := range processResult.Files {
 				fileID := file.FileID
@@ -205,7 +205,7 @@ func convertMultimodalMessages(messages []types.Message) ConvertedMessages {
 						fileID = "unknown"
 					}
 				}
-				
+
 				result.Files = append(result.Files, File{
 					Type: file.Type,
 					ID:   fileID,
@@ -219,12 +219,12 @@ func convertMultimodalMessages(messages []types.Message) ConvertedMessages {
 				upstreamMsg.Content = ""
 			}
 		}
-		
+
 		// 添加推理内容（如果有）
 		if msg.ReasoningContent != "" {
 			upstreamMsg.ReasoningContent = msg.ReasoningContent
 		}
-		
+
 		// 如果有内容或工具调用，添加消息
 		if upstreamMsg.Content != "" || len(msg.ToolCalls) > 0 || msg.Content == nil {
 			result.Messages = append(result.Messages, upstreamMsg)

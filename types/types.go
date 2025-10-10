@@ -12,39 +12,39 @@ import (
 
 // OpenAIRequest OpenAI 请求结构
 type OpenAIRequest struct {
-	Model             string                 `json:"model"`
-	Messages          []Message              `json:"messages"`
+	Model             string                 `json:"model" binding:"required,oneof=glm-4.5 glm-4.5-thinking glm-4.5-search glm-4.5v glm-4.5-air glm-4.6 gpt-4 gpt-4-turbo gpt-3.5-turbo claude-3-opus claude-3-sonnet claude-3-haiku deepseek-chat deepseek-coder"`
+	Messages          []Message              `json:"messages" binding:"required,min=1,max=50"`
 	Stream            bool                   `json:"stream,omitempty"`
-	Temperature       *float64               `json:"temperature,omitempty"`       // 使用指针表示可选
-	MaxTokens         *int                   `json:"max_tokens,omitempty"`        // 使用指针表示可选
-	TopP              *float64               `json:"top_p,omitempty"`             // 使用指针表示可选
-	N                 *int                   `json:"n,omitempty"`                 // 使用指针表示可选
-	Stop              interface{}            `json:"stop,omitempty"`              // string or []string
-	PresencePenalty   *float64               `json:"presence_penalty,omitempty"`  // 使用指针表示可选
-	FrequencyPenalty  *float64               `json:"frequency_penalty,omitempty"` // 使用指针表示可选
-	LogitBias         map[string]float64     `json:"logit_bias,omitempty"`        // 修正为float64
-	User              string                 `json:"user,omitempty"`
-	Tools             []Tool                 `json:"tools,omitempty"`
-	ToolChoice        interface{}            `json:"tool_choice,omitempty"` // 保持interface{}以支持多种格式
-	ResponseFormat    interface{}            `json:"response_format,omitempty"`
-	Seed              *int                   `json:"seed,omitempty"` // 使用指针表示可选
+	Temperature       *float64               `json:"temperature,omitempty" binding:"omitempty,gte=0,lte=2"`       // 使用指针表示可选
+	MaxTokens         *int                   `json:"max_tokens,omitempty" binding:"omitempty,gte=1,lte=240000"`        // 使用指针表示可选
+	TopP              *float64               `json:"top_p,omitempty" binding:"omitempty,gte=0,lte=1"`             // 使用指针表示可选
+	N                 *int                   `json:"n,omitempty" binding:"omitempty,gte=1,lte=10"`                 // 使用指针表示可选
+	Stop              interface{}            `json:"stop,omitempty" binding:"omitempty"`              // string or []string
+	PresencePenalty   *float64               `json:"presence_penalty,omitempty" binding:"omitempty,gte=-2,lte=2"`  // 使用指针表示可选
+	FrequencyPenalty  *float64               `json:"frequency_penalty,omitempty" binding:"omitempty,gte=-2,lte=2"` // 使用指针表示可选
+	LogitBias         map[string]float64     `json:"logit_bias,omitempty" binding:"omitempty"`        // 修正为float64
+	User              string                 `json:"user,omitempty" binding:"omitempty,max=100"`
+	Tools             []Tool                 `json:"tools,omitempty" binding:"omitempty,max=20"`
+	ToolChoice        interface{}            `json:"tool_choice,omitempty" binding:"omitempty"` // 保持interface{}以支持多种格式
+	ResponseFormat    interface{}            `json:"response_format,omitempty" binding:"omitempty"`
+	Seed              *int                   `json:"seed,omitempty" binding:"omitempty,gte=0"` // 使用指针表示可选
 	LogProbs          bool                   `json:"logprobs,omitempty"`
-	TopLogProbs       *int                   `json:"top_logprobs,omitempty"`        // 使用指针，需要0-5验证
+	TopLogProbs       *int                   `json:"top_logprobs,omitempty" binding:"omitempty,gte=0,lte=5"`        // 使用指针，需要0-5验证
 	ParallelToolCalls *bool                  `json:"parallel_tool_calls,omitempty"` // 使用指针表示可选
-	ServiceTier       string                 `json:"service_tier,omitempty"`        // 新增：服务层级
+	ServiceTier       string                 `json:"service_tier,omitempty" binding:"omitempty,oneof=auto default"`        // 新增：服务层级
 	Store             *bool                  `json:"store,omitempty"`               // 新增：是否存储
-	Metadata          map[string]interface{} `json:"metadata,omitempty"`            // 新增：元数据
+	Metadata          map[string]interface{} `json:"metadata,omitempty" binding:"omitempty"`            // 新增：元数据
 	// 符合OpenAI标准的兼容性参数
-	MaxCompletionTokens *int        `json:"max_completion_tokens,omitempty"` // 最大完成token数
-	TopK                *int        `json:"top_k,omitempty"`                 // Top-k采样
-	MinP                *float64    `json:"min_p,omitempty"`                 // Min-p采样
-	BestOf              *int        `json:"best_of,omitempty"`               // 最佳结果数
-	RepetitionPenalty   *float64    `json:"repetition_penalty,omitempty"`    // 重复惩罚
-	Grammar             interface{} `json:"grammar,omitempty"`               // 语法约束
-	GrammarType         string      `json:"grammar_type,omitempty"`          // 语法类型
+	MaxCompletionTokens *int        `json:"max_completion_tokens,omitempty" binding:"omitempty,gte=1,lte=240000"` // 最大完成token数
+	TopK                *int        `json:"top_k,omitempty" binding:"omitempty,gte=1,lte=100"`                 // Top-k采样
+	MinP                *float64    `json:"min_p,omitempty" binding:"omitempty,gte=0,lte=1"`                 // Min-p采样
+	BestOf              *int        `json:"best_of,omitempty" binding:"omitempty,gte=1,lte=5"`               // 最佳结果数
+	RepetitionPenalty   *float64    `json:"repetition_penalty,omitempty" binding:"omitempty,gte=0,lte=2"`    // 重复惩罚
+	Grammar             interface{} `json:"grammar,omitempty" binding:"omitempty"`               // 语法约束
+	GrammarType         string      `json:"grammar_type,omitempty" binding:"omitempty,oneof=bnf gbnf regex"`          // 语法类型
 	// 保持向后兼容的参数
-	MaxInputTokens      *int `json:"max_input_tokens,omitempty"`      // 最大输入token数
-	MinCompletionTokens *int `json:"min_completion_tokens,omitempty"` // 最小完成token数
+	MaxInputTokens      *int `json:"max_input_tokens,omitempty" binding:"omitempty,gte=1,lte=1000000"`      // 最大输入token数
+	MinCompletionTokens *int `json:"min_completion_tokens,omitempty" binding:"omitempty,gte=0,lte=240000"` // 最小完成token数
 	// 新增工具调用增强参数
 	ToolChoiceObject *ToolChoice `json:"-"` // 内部使用的解析后的ToolChoice对象
 }
@@ -56,15 +56,15 @@ type OpenAIResponse struct {
 	Created int64    `json:"created"`
 	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
-	Usage   Usage    `json:"usage,omitempty"`
+	Usage   *Usage   `json:"usage,omitempty"` // 使用指针，只在需要时设置
 }
 
 // Choice 选择结构
 type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message,omitempty"`
-	Delta        Delta   `json:"delta,omitempty"`
-	FinishReason string  `json:"finish_reason,omitempty"`
+	Index        int      `json:"index"`
+	Message      *Message `json:"message,omitempty"` // 改为指针类型，流式响应时为nil
+	Delta        Delta    `json:"delta,omitempty"`
+	FinishReason string   `json:"finish_reason,omitempty"`
 }
 
 // Delta 增量结构
@@ -88,46 +88,46 @@ type Usage struct {
 
 // Message 消息结构（支持多模态内容）
 type Message struct {
-	Role             string      `json:"role"`
-	Content          interface{} `json:"content"` // 支持 string 或 []ContentPart
-	ReasoningContent string      `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCall  `json:"tool_calls,omitempty"`
+	Role             string      `json:"role" binding:"required,oneof=system user assistant developer tool"`
+	Content          interface{} `json:"content" binding:"required"` // 支持 string 或 []ContentPart
+	ReasoningContent string      `json:"reasoning_content,omitempty" binding:"omitempty,max=10000"`
+	ToolCalls        []ToolCall  `json:"tool_calls,omitempty" binding:"omitempty,max=10"`
 }
 
 // ContentPart 内容部分结构（用于多模态消息）
 type ContentPart struct {
-	Type        string       `json:"type"`
-	Text        string       `json:"text,omitempty"`
+	Type        string       `json:"type" binding:"required,oneof=text image_url video_url document_url audio_url file"`
+	Text        string       `json:"text,omitempty" binding:"omitempty,max=100000"`
 	ImageURL    *ImageURL    `json:"image_url,omitempty"`
 	VideoURL    *VideoURL    `json:"video_url,omitempty"`
 	DocumentURL *DocumentURL `json:"document_url,omitempty"`
 	AudioURL    *AudioURL    `json:"audio_url,omitempty"`
 	// 兼容性字段
-	URL      string `json:"url,omitempty"`       // 保持向后兼容
-	AltText  string `json:"alt_text,omitempty"`  // 替代文本
-	Size     int64  `json:"size,omitempty"`      // 文件大小
-	MimeType string `json:"mime_type,omitempty"` // MIME类型
+	URL      string `json:"url,omitempty" binding:"omitempty,url"`       // 保持向后兼容
+	AltText  string `json:"alt_text,omitempty" binding:"omitempty,max=500"`  // 替代文本
+	Size     int64  `json:"size,omitempty" binding:"omitempty,gte=0,lte=104857600"`     // 文件大小 (最大100MB)
+	MimeType string `json:"mime_type,omitempty" binding:"omitempty,max=100"` // MIME类型
 }
 
 // ImageURL 图像URL结构
 type ImageURL struct {
-	URL    string `json:"url"`
-	Detail string `json:"detail,omitempty"` // low, high, auto
+	URL    string `json:"url" binding:"required,url"`
+	Detail string `json:"detail,omitempty" binding:"omitempty,oneof=low high auto"`
 }
 
 // VideoURL 视频URL结构
 type VideoURL struct {
-	URL string `json:"url"`
+	URL string `json:"url" binding:"required,url"`
 }
 
 // DocumentURL 文档URL结构
 type DocumentURL struct {
-	URL string `json:"url"`
+	URL string `json:"url" binding:"required,url"`
 }
 
 // AudioURL 音频URL结构
 type AudioURL struct {
-	URL string `json:"url"`
+	URL string `json:"url" binding:"required,url"`
 }
 
 // ============================================
@@ -136,39 +136,39 @@ type AudioURL struct {
 
 // Tool 工具结构
 type Tool struct {
-	Type     string       `json:"type"`
-	Function ToolFunction `json:"function"`
+	Type     string       `json:"type" binding:"required,oneof=function"`
+	Function ToolFunction `json:"function" binding:"required"`
 	// 添加更多工具参数以增强兼容性
-	Description string                 `json:"description,omitempty"`
-	Parameters  map[string]interface{} `json:"parameters,omitempty"`
+	Description string                 `json:"description,omitempty" binding:"omitempty,max=500"`
+	Parameters  map[string]interface{} `json:"parameters,omitempty" binding:"omitempty"`
 	Strict      *bool                  `json:"strict,omitempty"`
-	Context     map[string]interface{} `json:"context,omitempty"`
+	Context     map[string]interface{} `json:"context,omitempty" binding:"omitempty"`
 }
 
 // ToolFunction 工具函数结构
 type ToolFunction struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Parameters  map[string]interface{} `json:"parameters"` // 使用具体类型而不是interface{}
+	Name        string                 `json:"name" binding:"required,max=64"`
+	Description string                 `json:"description" binding:"required,max=500"`
+	Parameters  map[string]interface{} `json:"parameters" binding:"required"` // 使用具体类型而不是interface{}
 	// 添加更多工具函数参数以增强兼容性
 	Strict   *bool                  `json:"strict,omitempty"`   // 严格模式
-	Require  []string               `json:"require,omitempty"`  // 必需参数
-	Optional []string               `json:"optional,omitempty"` // 可选参数
-	Context  map[string]interface{} `json:"context,omitempty"`  // 上下文信息
+	Require  []string               `json:"require,omitempty" binding:"omitempty,max=20"`  // 必需参数
+	Optional []string               `json:"optional,omitempty" binding:"omitempty,max=20"` // 可选参数
+	Context  map[string]interface{} `json:"context,omitempty" binding:"omitempty"`  // 上下文信息
 }
 
 // ToolCall 工具调用结构 - 符合OpenAI API标准
 type ToolCall struct {
 	Index    int              `json:"-"`        // 内部使用，不序列化到JSON
-	ID       string           `json:"id"`       // 必需字段
-	Type     string           `json:"type"`     // 必需字段，通常为"function"
-	Function ToolCallFunction `json:"function"` // 必需字段
+	ID       string           `json:"id" binding:"required"`       // 必需字段
+	Type     string           `json:"type" binding:"required,oneof=function"`     // 必需字段，通常为"function"
+	Function ToolCallFunction `json:"function" binding:"required"` // 必需字段
 }
 
 // ToolCallFunction 工具调用函数结构
 type ToolCallFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Name      string `json:"name" binding:"required,max=64"`
+	Arguments string `json:"arguments" binding:"required"`
 }
 
 // ToolChoice 工具选择结构

@@ -15,12 +15,12 @@ type MultimodalProcessor struct {
 
 // ProcessResult 处理结果
 type ProcessResult struct {
-	Text      string              // 提取的文本内容
-	Images    []string            // 图片URL列表
-	Videos    []string            // 视频URL列表
-	Documents []string            // 文档URL列表
-	Audios    []string            // 音频URL列表
-	Files     []ProcessedFile     // 处理后的文件信息
+	Text      string          // 提取的文本内容
+	Images    []string        // 图片URL列表
+	Videos    []string        // 视频URL列表
+	Documents []string        // 文档URL列表
+	Audios    []string        // 音频URL列表
+	Files     []ProcessedFile // 处理后的文件信息
 }
 
 // ProcessedFile 处理后的文件
@@ -100,7 +100,7 @@ func (p *MultimodalProcessor) processContentParts(parts []types.ContentPart) (*P
 					Type: "image",
 					URL:  url,
 				})
-				
+
 				if p.EnableDebugLog {
 					p.logDebug("检测到图像内容: %s (detail: %s)", url, part.ImageURL.Detail)
 				}
@@ -114,7 +114,7 @@ func (p *MultimodalProcessor) processContentParts(parts []types.ContentPart) (*P
 					Type: "video",
 					URL:  url,
 				})
-				
+
 				if p.EnableDebugLog {
 					p.logDebug("检测到视频内容: %s", url)
 				}
@@ -128,7 +128,7 @@ func (p *MultimodalProcessor) processContentParts(parts []types.ContentPart) (*P
 					Type: "document",
 					URL:  url,
 				})
-				
+
 				if p.EnableDebugLog {
 					p.logDebug("检测到文档内容: %s", url)
 				}
@@ -142,7 +142,7 @@ func (p *MultimodalProcessor) processContentParts(parts []types.ContentPart) (*P
 					Type: "audio",
 					URL:  url,
 				})
-				
+
 				if p.EnableDebugLog {
 					p.logDebug("检测到音频内容: %s", url)
 				}
@@ -156,7 +156,7 @@ func (p *MultimodalProcessor) processContentParts(parts []types.ContentPart) (*P
 	}
 
 	result.Text = textBuilder.String()
-	
+
 	// 记录统计信息
 	if p.EnableDebugLog {
 		p.logStats(result)
@@ -203,7 +203,7 @@ func (p *MultimodalProcessor) processInterfaceArray(parts []interface{}) (*Proce
 						Type: "image",
 						URL:  url,
 					})
-					
+
 					if p.EnableDebugLog {
 						detail, _ := imageURL["detail"].(string)
 						p.logDebug("检测到图像内容: %s (detail: %s)", url, detail)
@@ -219,7 +219,7 @@ func (p *MultimodalProcessor) processInterfaceArray(parts []interface{}) (*Proce
 						Type: "video",
 						URL:  url,
 					})
-					
+
 					if p.EnableDebugLog {
 						p.logDebug("检测到视频内容: %s", url)
 					}
@@ -234,7 +234,7 @@ func (p *MultimodalProcessor) processInterfaceArray(parts []interface{}) (*Proce
 						Type: "document",
 						URL:  url,
 					})
-					
+
 					if p.EnableDebugLog {
 						p.logDebug("检测到文档内容: %s", url)
 					}
@@ -249,7 +249,7 @@ func (p *MultimodalProcessor) processInterfaceArray(parts []interface{}) (*Proce
 						Type: "audio",
 						URL:  url,
 					})
-					
+
 					if p.EnableDebugLog {
 						p.logDebug("检测到音频内容: %s", url)
 					}
@@ -277,7 +277,7 @@ func (p *MultimodalProcessor) processInterfaceArray(parts []interface{}) (*Proce
 	}
 
 	result.Text = textBuilder.String()
-	
+
 	// 记录统计信息
 	if p.EnableDebugLog {
 		p.logStats(result)
@@ -310,17 +310,17 @@ func (p *MultimodalProcessor) HasMultimedia(content interface{}) bool {
 	if err != nil {
 		return false
 	}
-	
-	totalMedia := len(result.Images) + len(result.Videos) + 
+
+	totalMedia := len(result.Images) + len(result.Videos) +
 		len(result.Documents) + len(result.Audios)
-	
+
 	return totalMedia > 0
 }
 
 // GetMediaStats 获取媒体统计信息
 func (p *MultimodalProcessor) GetMediaStats(content interface{}) map[string]int {
 	result, _ := p.ProcessContent(content)
-	
+
 	return map[string]int{
 		"text":      len(strings.TrimSpace(result.Text)),
 		"images":    len(result.Images),
@@ -340,15 +340,15 @@ func (p *MultimodalProcessor) logDebug(format string, args ...interface{}) {
 
 // logStats 记录统计信息
 func (p *MultimodalProcessor) logStats(result *ProcessResult) {
-	totalMedia := len(result.Images) + len(result.Videos) + 
+	totalMedia := len(result.Images) + len(result.Videos) +
 		len(result.Documents) + len(result.Audios)
-	
+
 	if totalMedia > 0 {
 		p.logDebug("多模态内容统计: 文本长度(%d) 图像(%d) 视频(%d) 文档(%d) 音频(%d)",
-			len(result.Text), len(result.Images), len(result.Videos), 
+			len(result.Text), len(result.Images), len(result.Videos),
 			len(result.Documents), len(result.Audios))
 	}
-	
+
 	// 检查模型支持
 	if p.Model != "" {
 		modelLower := strings.ToLower(p.Model)
@@ -363,7 +363,7 @@ func (p *MultimodalProcessor) logStats(result *ProcessResult) {
 // ConvertToUpstreamMessage 将处理结果转换为上游消息格式
 func (p *MultimodalProcessor) ConvertToUpstreamMessage(msg types.Message) (types.UpstreamMessage, []ProcessedFile) {
 	result, _ := p.ProcessContent(msg.Content)
-	
+
 	return types.UpstreamMessage{
 		Role:             msg.Role,
 		Content:          result.Text,

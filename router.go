@@ -7,6 +7,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/requestid"
 	"github.com/gin-gonic/gin"
+	"z2api/errors"
 	"z2api/utils"
 )
 
@@ -21,10 +22,10 @@ func setupRouter() *gin.Engine {
 	router := gin.New()
 
 	// 添加中间件
-	router.Use(ginLogger())      // 自定义日志中间件
-	router.Use(gin.Recovery())   // 恢复中间件
-	router.Use(requestid.New())  // Request ID 中间件
-	router.Use(setupCORS())      // CORS 中间件
+	router.Use(ginLogger())           // 自定义日志中间件
+	router.Use(gin.Recovery())        // 恢复中间件
+	router.Use(requestid.New())       // Request ID 中间件
+	router.Use(setupCORS())           // CORS 中间件
 	router.Use(rateLimitMiddleware()) // 限流中间件
 
 	// 注册路由 - 使用 Gin 原生处理器
@@ -105,8 +106,8 @@ func rateLimitMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 尝试获取信号量
 		if !concurrencyLimiter.TryAcquire(1) {
-			utils.ErrorResponse(c, StatusTooManyRequests, "rate_limit_exceeded",
-				"Too many concurrent requests, please try again later", nil)
+			err := errors.ErrRateLimited.WithDetails("Too many concurrent requests, please try again later")
+			utils.ErrorResponse(c, err)
 			c.Abort()
 			return
 		}

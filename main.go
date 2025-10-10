@@ -1267,7 +1267,6 @@ func loadDashboardHTML() (string, error) {
 
 var dashboardHTML string
 
-
 // main is the entry point of the application
 func main() {
 	// 加载和验证配置（需要先加载配置，以便知道是否是调试模式）
@@ -1378,7 +1377,7 @@ func main() {
 
 // callUpstreamWithHeaders 调用上游API
 // 优化：使用 sonic 对象池进行序列化
-func callUpstreamWithHeaders(upstreamReq types.UpstreamRequest, refererChatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
+func callUpstreamWithHeaders(ctx context.Context, upstreamReq types.UpstreamRequest, refererChatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
 	// 创建带超时的上下文 - 根据请求类型动态调整超时时间
 	var timeout time.Duration
 	if upstreamReq.Stream {
@@ -1387,7 +1386,8 @@ func callUpstreamWithHeaders(upstreamReq types.UpstreamRequest, refererChatID st
 		timeout = 120 * time.Second // 非流式请求使用较短超时
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// 使用传入的context，如果没有设置超时则设置超时
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 
 	// 使用对象池减少内存分配
 	buf := bytesBufferPool.Get().(*bytes.Buffer)
@@ -1467,7 +1467,7 @@ func callUpstreamWithHeaders(upstreamReq types.UpstreamRequest, refererChatID st
 	debugLog("构建的完整URL: %s", upstreamURL)
 	debugLog("查询参数: user_id=%s, current_url=%s, pathname=%s", userID, currentURL, pathname)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(buf.Bytes()))
+	req, err := http.NewRequestWithContext(timeoutCtx, "POST", upstreamURL, bytes.NewReader(buf.Bytes()))
 	if err != nil {
 		debugLog("创建HTTP请求失败: %v", err)
 		cancel() // 手动取消上下文
@@ -1596,18 +1596,17 @@ func isRetryableError(err error, statusCode int, responseBody []byte) bool {
 	}
 
 	// 检查HTTP状态码
+	if statusCode >= 500 && statusCode <= 599 {
+		debugLog("检测到 5xx 服务器错误 %d，可重试", statusCode)
+		return true
+	}
+
 	switch statusCode {
 	case StatusUnauthorized: // 401
 		debugLog("401错误，需要重新认证，可重试")
 		return true
 	case StatusTooManyRequests: // 429
 		debugLog("429限流错误，可重试")
-		return true
-	case StatusBadGateway, StatusServiceUnavailable, StatusGatewayTimeout: // 502, 503, 504
-		debugLog("网关错误 %d，可重试", statusCode)
-		return true
-	case StatusInternalServerError: // 500
-		debugLog("500服务器内部错误，可重试")
 		return true
 	case StatusRequestTimeout: // 408
 		debugLog("408请求超时，可重试")
@@ -1660,17 +1659,24 @@ func calculateBackoffDelay(attempt int, baseDelay time.Duration, maxDelay time.D
 }
 
 // callUpstreamWithRetry 调用上游API并处理重试，改进资源管理和超时控制
-func callUpstreamWithRetry(upstreamReq types.UpstreamRequest, chatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
+func callUpstreamWithRetry(ctx context.Context, upstreamReq types.UpstreamRequest, chatID string, authToken string, sessionID string) (*http.Response, context.CancelFunc, error) {
 	var lastErr error
 	maxRetries := 5 // 增加到5次重试
 	baseDelay := 100 * time.Millisecond
 	maxDelay := 10 * time.Second
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// 检查context是否已取消
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		default:
+		}
+
 		debugLog("开始第 %d/%d 次尝试调用上游API", attempt+1, maxRetries)
 
 		// 每次重试都创建新的context，避免context污染
-		resp, cancel, err := callUpstreamWithHeaders(upstreamReq, chatID, authToken, sessionID)
+		resp, cancel, err := callUpstreamWithHeaders(ctx, upstreamReq, chatID, authToken, sessionID)
 
 		// 检查是否需要重试（包括网络错误）
 		if err != nil {
@@ -1685,7 +1691,12 @@ func callUpstreamWithRetry(upstreamReq types.UpstreamRequest, chatID string, aut
 				if attempt < maxRetries-1 {
 					delay := calculateBackoffDelay(attempt, baseDelay, maxDelay)
 					debugLog("网络错误，等待 %v 后重试", delay)
-					time.Sleep(delay)
+					// time.Sleep(delay)
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+						return nil, nil, ctx.Err()
+					}
 
 					// 如果是超时或认证错误，可能需要刷新token
 					if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline") {
@@ -1711,7 +1722,7 @@ func callUpstreamWithRetry(upstreamReq types.UpstreamRequest, chatID string, aut
 		if resp != nil {
 			// 读取一些响应体用于错误分析（如果需要）
 			var bodyBytes []byte
-			if resp.StatusCode != StatusOK {
+			if resp.StatusCode != http.StatusOK {
 				// 尝试读取响应体用于错误分析
 				bodyBytes, _ = io.ReadAll(io.LimitReader(resp.Body, 1024)) // 最多读1KB用于分析
 				// 重新包装响应体，以便后续处理
@@ -1719,17 +1730,18 @@ func callUpstreamWithRetry(upstreamReq types.UpstreamRequest, chatID string, aut
 			}
 
 			// 检查状态码
-			if resp.StatusCode == StatusOK {
+			if resp.StatusCode == http.StatusOK {
 				debugLog("上游调用成功 (尝试 %d/%d): %d", attempt+1, maxRetries, resp.StatusCode)
 				return resp, cancel, nil // 成功，直接返回
 			}
 
 			// 检查是否为可重试的HTTP错误
 			if isRetryableError(nil, resp.StatusCode, bodyBytes) {
-				debugLog("收到可重试的HTTP状态码 %d (尝试 %d/%d)", resp.StatusCode, attempt+1, maxRetries)
+								lastErr = fmt.Errorf("上游API返回可重试的状态码 %d", resp.StatusCode)
+				debugLog("收到可重试的HTTP状态码 %d (尝试 %d/%d)，错误详情: %s", resp.StatusCode, attempt+1, maxRetries, string(bodyBytes))
 
 				// 特殊处理401错误
-				if resp.StatusCode == StatusUnauthorized {
+				if resp.StatusCode == http.StatusUnauthorized {
 					debugLog("收到401错误，尝试刷新token和重新生成签名")
 					// 标记token为失效
 					if tokenCache != nil {
@@ -1753,14 +1765,22 @@ func callUpstreamWithRetry(upstreamReq types.UpstreamRequest, chatID string, aut
 				// 如果不是最后一次尝试，等待后重试
 				if attempt < maxRetries-1 {
 					// 对于429限流，使用更长的基础延迟
-					if resp.StatusCode == StatusTooManyRequests {
+					if resp.StatusCode == http.StatusTooManyRequests {
 						delay := calculateBackoffDelay(attempt, 1*time.Second, 180*time.Second)
 						debugLog("限流错误，等待 %v 后重试", delay)
-						time.Sleep(delay)
+						select {
+						case <-time.After(delay):
+						case <-ctx.Done():
+							return nil, nil, ctx.Err()
+						}
 					} else {
 						delay := calculateBackoffDelay(attempt, baseDelay, maxDelay)
 						debugLog("等待 %v 后重试", delay)
-						time.Sleep(delay)
+						select {
+						case <-time.After(delay):
+						case <-ctx.Done():
+							return nil, nil, ctx.Err()
+						}
 					}
 					continue
 				}

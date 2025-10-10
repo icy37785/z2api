@@ -6,6 +6,7 @@ import (
 	"time"
 	"z2api/types"
 	"z2api/utils"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -30,7 +31,7 @@ const (
 
 // createChatCompletionChunk 统一创建聊天完成响应块
 // 根据不同的phase创建对应格式的响应，保持响应格式的一致性
-func createChatCompletionChunk(content string, model string, phase ResponsePhase, usage *types.Usage, finishReason string) types.OpenAIResponse{
+func createChatCompletionChunk(content string, model string, phase ResponsePhase, usage *types.Usage, finishReason string) types.OpenAIResponse {
 	timestamp := time.Now().Unix()
 	response := types.OpenAIResponse{
 		ID:      utils.GenerateChatCompletionID(),
@@ -69,7 +70,7 @@ func createChatCompletionChunk(content string, model string, phase ResponsePhase
 			response.Choices[0].FinishReason = finishReason
 		}
 		if usage != nil {
-			response.Usage = *usage
+			response.Usage = usage
 		}
 	case PhaseDone:
 		// 完成阶段：仅设置结束原因
@@ -83,7 +84,7 @@ func createChatCompletionChunk(content string, model string, phase ResponsePhase
 }
 
 // createToolCallChunk 创建工具调用响应块
-func createToolCallChunk(toolCalls []types.ToolCall, model string, finishReason string) types.OpenAIResponse{
+func createToolCallChunk(toolCalls []types.ToolCall, model string, finishReason string) types.OpenAIResponse {
 	timestamp := time.Now().Unix()
 	return types.OpenAIResponse{
 		ID:      utils.GenerateChatCompletionID(),
@@ -176,7 +177,7 @@ func (m *ToolCallManager) AddToolCalls(calls []types.ToolCall) {
 }
 
 // GetSortedCalls 获取排序后的工具调用列表
-func (m *ToolCallManager) GetSortedCalls() []types.ToolCall{
+func (m *ToolCallManager) GetSortedCalls() []types.ToolCall {
 	if len(m.calls) == 0 {
 		return nil
 	}
